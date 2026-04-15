@@ -67,7 +67,8 @@ install_mihomo_core() {
     info "开始安装 Mihomo 核心..."
     local arch machine; machine="$(uname -m)"
     case "$machine" in
-        x86_64|amd64) arch="amd64" ;;
+        # 👇 关键修改：将 amd64 改为 amd64-compatible
+        x86_64|amd64) arch="amd64-compatible" ;;
         aarch64|arm64) arch="arm64" ;;
         *) error "不支持的 CPU 架构: $machine"; return 1 ;;
     esac
@@ -302,16 +303,13 @@ listener_block = '''
     users:
       - uuid: {uuid}
         flow: xtls-rprx-vision
-    tls:
-      enabled: true
-      reality:
-        enabled: true
-        private-key: {private_key}
-        dest: {domain}:443
-        server-names:
-          - {domain}
-        short-id:
-          - {shortid}'''.format(tag=tag, port=port, uuid=uuid, domain=domain, private_key=private_key, shortid=shortid)
+    reality-config:
+      dest: {domain}:443
+      private-key: {private_key}
+      server-names:
+        - {domain}
+      short-id:
+        - {shortid}'''.format(tag=tag, port=port, uuid=uuid, domain=domain, private_key=private_key, shortid=shortid)
 
 if re.search(r'^listeners:\s*\[\]\s*$', content, re.MULTILINE):
     content = re.sub(r'^listeners:\s*\[\]\s*$', 'listeners:' + listener_block, content, flags=re.MULTILINE)
