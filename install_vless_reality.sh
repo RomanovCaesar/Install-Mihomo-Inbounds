@@ -302,13 +302,12 @@ listener_block = '''
     users:
       - uuid: {uuid}
         flow: xtls-rprx-vision
-    ws-path: \"\"
     reality-config:
       dest: {domain}:443
       private-key: {private_key}
       server-names:
         - {domain}
-      short-ids:
+      short-id:
         - {shortid}'''.format(tag=tag, port=port, uuid=uuid, domain=domain, private_key=private_key, shortid=shortid)
 
 if re.search(r'^listeners:\s*\[\]\s*$', content, re.MULTILINE):
@@ -742,20 +741,46 @@ with open(config_path, 'w') as f:
 
     # 生成新密钥
     info "正在生成 Reality 密钥对..."
-    local key_pair=$($mihomo_binary_path generate reality-keypair 2>/dev/null || openssl genpkey -algorithm x25519 2>/dev/null | openssl pkey -text -noout 2>/dev/null)
     local private_key public_key
-    
-    # 尝试使用 mihomo 生成
-    if echo "$key_pair" | grep -qi 'private'; then
-        private_key=$(echo "$key_pair" | grep -i 'private' | awk '{print $NF}')
-        public_key=$(echo "$key_pair" | grep -iE 'public' | awk '{print $NF}')
+    local key_output
+    key_output=$($mihomo_binary_path generate reality-keypair 2>&1 || true)
+
+    if echo "$key_output" | grep -qi 'private'; then
+        private_key=$(echo "$key_output" | grep -i 'private' | sed 's/.*:[[:space:]]*//' | tr -d '[:space:]')
+        public_key=$(echo "$key_output" | grep -i 'public' | sed 's/.*:[[:space:]]*//' | tr -d '[:space:]')
     else
-        # 使用 openssl 生成 x25519 密钥对
-        local tmpkey; tmpkey=$(mktemp)
-        openssl genpkey -algorithm x25519 -out "$tmpkey" 2>/dev/null
-        private_key=$(openssl pkey -in "$tmpkey" -text -noout 2>/dev/null | grep -A2 'priv:' | tail -1 | tr -d ' :\n' || openssl rand -base64 32)
-        public_key=$(openssl pkey -in "$tmpkey" -pubout -text -noout 2>/dev/null | grep -A2 'pub:' | tail -1 | tr -d ' :\n' || openssl rand -base64 32)
-        rm -f "$tmpkey"
+        # 使用 Python3 生成 x25519 密钥对
+        info "使用 Python3 生成 x25519 密钥对..."
+        local py_keys
+        py_keys=$(python3 -c "
+import base64, os
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    sk = X25519PrivateKey.generate()
+    sk_raw = sk.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    pk_raw = sk.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    print(base64.urlsafe_b64encode(sk_raw).decode().rstrip('='))
+    print(base64.urlsafe_b64encode(pk_raw).decode().rstrip('='))
+except ImportError:
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix='.pem', delete=False) as f:
+        tmp = f.name
+    subprocess.run(['openssl', 'genpkey', '-algorithm', 'x25519', '-out', tmp], check=True, capture_output=True)
+    r1 = subprocess.run(['openssl', 'pkey', '-in', tmp, '-outform', 'DER'], capture_output=True, check=True)
+    r2 = subprocess.run(['openssl', 'pkey', '-in', tmp, '-pubout', '-outform', 'DER'], capture_output=True, check=True)
+    os.unlink(tmp)
+    sk_raw = r1.stdout[-32:]
+    pk_raw = r2.stdout[-32:]
+    print(base64.urlsafe_b64encode(sk_raw).decode().rstrip('='))
+    print(base64.urlsafe_b64encode(pk_raw).decode().rstrip('='))
+" 2>&1) || true
+        if [[ $(echo "$py_keys" | wc -l) -ge 2 ]]; then
+            private_key=$(echo "$py_keys" | sed -n '1p' | tr -d '[:space:]')
+            public_key=$(echo "$py_keys" | sed -n '2p' | tr -d '[:space:]')
+        else
+            error "密钥生成失败"; return
+        fi
     fi
 
     echo "$public_key" > "/root/mihomo_reality_pubkey_${target_p}.txt"
@@ -781,14 +806,48 @@ run_install() {
     key_output=$($mihomo_binary_path generate reality-keypair 2>&1 || true)
 
     if echo "$key_output" | grep -qi 'private'; then
-        private_key=$(echo "$key_output" | grep -i 'private' | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
-        public_key=$(echo "$key_output" | grep -i 'public' | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+        # 解析 mihomo 输出格式: PrivateKey: xxx / PublicKey: xxx
+        private_key=$(echo "$key_output" | grep -i 'private' | sed 's/.*:[[:space:]]*//' | tr -d '[:space:]')
+        public_key=$(echo "$key_output" | grep -i 'public' | sed 's/.*:[[:space:]]*//' | tr -d '[:space:]')
+        info "已使用 mihomo 生成 Reality 密钥对。"
     else
-        # 使用 openssl 作为 fallback
-        info "使用 openssl 生成 x25519 密钥对..."
-        private_key=$(openssl rand -base64 32)
-        public_key=$(openssl rand -base64 32)
-        error "警告: mihomo 密钥生成命令不可用，请确认密钥是否兼容。"
+        # 使用 Python3 生成真正的 x25519 密钥对 (兼容 Reality 协议)
+        info "mihomo generate 不可用，使用 Python3 生成 x25519 密钥对..."
+        local py_keys
+        py_keys=$(python3 -c "
+import base64, os, hashlib
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    sk = X25519PrivateKey.generate()
+    sk_raw = sk.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    pk_raw = sk.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    print(base64.urlsafe_b64encode(sk_raw).decode().rstrip('='))
+    print(base64.urlsafe_b64encode(pk_raw).decode().rstrip('='))
+except ImportError:
+    # 没有 cryptography 库时，使用 openssl 命令行
+    import subprocess, tempfile
+    with tempfile.NamedTemporaryFile(suffix='.pem', delete=False) as f:
+        tmp = f.name
+    subprocess.run(['openssl', 'genpkey', '-algorithm', 'x25519', '-out', tmp], check=True, capture_output=True)
+    r1 = subprocess.run(['openssl', 'pkey', '-in', tmp, '-outform', 'DER'], capture_output=True, check=True)
+    r2 = subprocess.run(['openssl', 'pkey', '-in', tmp, '-pubout', '-outform', 'DER'], capture_output=True, check=True)
+    os.unlink(tmp)
+    # DER 格式: x25519 私钥的原始 32 字节在末尾
+    sk_raw = r1.stdout[-32:]
+    pk_raw = r2.stdout[-32:]
+    print(base64.urlsafe_b64encode(sk_raw).decode().rstrip('='))
+    print(base64.urlsafe_b64encode(pk_raw).decode().rstrip('='))
+" 2>&1) || true
+
+        if [[ $(echo "$py_keys" | wc -l) -ge 2 ]]; then
+            private_key=$(echo "$py_keys" | sed -n '1p' | tr -d '[:space:]')
+            public_key=$(echo "$py_keys" | sed -n '2p' | tr -d '[:space:]')
+            info "已使用 Python3 生成 x25519 密钥对。"
+        else
+            error "生成 Reality 密钥对失败！请确保 Python3 和 openssl 已安装。"
+            exit 1
+        fi
     fi
 
     if [[ -z "$private_key" || -z "$public_key" ]]; then
