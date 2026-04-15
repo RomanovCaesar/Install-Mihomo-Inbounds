@@ -302,13 +302,16 @@ listener_block = '''
     users:
       - uuid: {uuid}
         flow: xtls-rprx-vision
-    reality-config:
-      dest: {domain}:443
-      private-key: {private_key}
-      server-names:
-        - {domain}
-      short-id:
-        - {shortid}'''.format(tag=tag, port=port, uuid=uuid, domain=domain, private_key=private_key, shortid=shortid)
+    tls:
+      enabled: true
+      reality:
+        enabled: true
+        private-key: {private_key}
+        dest: {domain}:443
+        server-names:
+          - {domain}
+        short-id:
+          - {shortid}'''.format(tag=tag, port=port, uuid=uuid, domain=domain, private_key=private_key, shortid=shortid)
 
 if re.search(r'^listeners:\s*\[\]\s*$', content, re.MULTILINE):
     content = re.sub(r'^listeners:\s*\[\]\s*$', 'listeners:' + listener_block, content, flags=re.MULTILINE)
