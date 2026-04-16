@@ -1,9 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# Caesar 蜜汁 Mihomo 服务端分流脚本 v1.0
+# Caesar 蜜汁 Mihomo 服务端分流脚本 v2.0
 # 适配环境：Debian/Ubuntu/Alpine
 # 依赖：curl, python3, openssl
 # 功能：安装Geo数据、添加Outbounds(代理)、添加Routing(规则)、查询配置
+# 增强：完全支持 Socks5 / SS2022 / VLESS-Reality，并支持 IN-NAME 链式路由分流
 # ==============================================================================
 
 # --- 全局设置 ---
@@ -16,7 +17,6 @@ PLAIN='\033[0m'
 
 CONFIG_FILE="/usr/local/etc/mihomo/config.yaml"
 SCRIPT_PATH="/usr/bin/mihomo-routing"
-GEO_DIR="/usr/local/etc/mihomo"
 
 # --- 基础函数 ---
 die() { echo -e "${RED}[ERROR] $*${PLAIN}" >&2; exit 1; }
@@ -35,7 +35,6 @@ pre_check() {
     fi
 
     local deps=("curl" "python3" "openssl")
-    
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
             info "正在安装依赖: $dep ..."
@@ -52,7 +51,6 @@ pre_check() {
 install_self() {
     local current_path
     current_path="$(realpath "$0")"
-    
     if [[ "$current_path" != "$SCRIPT_PATH" ]]; then
         info "正在安装脚本到 $SCRIPT_PATH ..."
         cp "$current_path" "$SCRIPT_PATH"
@@ -75,56 +73,113 @@ restart_mihomo() {
     fi
 }
 
-# --- 辅助：按任意键继续 ---
 pause() {
     echo
     read -n 1 -s -r -p "按任意键回到主菜单..." || true
     echo
 }
 
-# --- 功能 1: 安装 Geo 文件与定时任务 ---
-install_geo_assets() {
-    local updater_script="/root/update_geo.sh"
-    local updater_url="https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/update_geo.sh"
+# --- 核心：配置注入器 (Python) ---
+run_insert_proxy() {
+    local config=$1
+    local snippet=$2
+    cat << 'EOF' > /tmp/insert_proxy.py
+import sys, re
+config_path = sys.argv[1]
+yaml_snippet = sys.argv[2]
 
-    info "正在拉取自动更新脚本 update_geo.sh ..."
-    
-    if curl -fsSL -o "$updater_script" "$updater_url"; then
-        chmod +x "$updater_script"
-        info "脚本下载成功: $updater_script"
-    else
-        die "无法从 Github 下载更新脚本。"
-    fi
+with open(config_path, 'r') as f:
+    content = f.read()
 
-    info "正在执行第一次 Geo 文件下载与安装..."
-    if "$updater_script"; then
-        info "初始化下载成功！"
-    else
-        die "初始化下载失败。"
-    fi
+if not re.search(r'^proxies:', content, re.MULTILINE):
+    content += '\nproxies:\n'
+
+lines = content.split('\n')
+result = []
+in_proxies = False
+inserted = False
+
+for line in lines:
+    if line.startswith('proxies:'):
+        in_proxies = True
+        result.append(line)
+        continue
     
-    info "设置 Crontab 定时任务 (每天凌晨 3:00 执行 /root/update_geo.sh)..."
-    
-    local cron_job="0 3 * * * $updater_script >> /var/log/update_geo.log 2>&1"
-    
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null > "$tmp_cron" || true
-    
-    sed -i '/update_geo.sh/d' "$tmp_cron"
-    
-    echo "$cron_job" >> "$tmp_cron"
-    crontab "$tmp_cron"
-    rm -f "$tmp_cron"
-    
-    info "Geo 文件自动更新已配置完成！"
-    info "日志将保存在: /var/log/update_geo.log"
-    pause
+    if in_proxies and not inserted:
+        if line.strip() == '' or line.strip().startswith('#') or line.startswith(' '):
+            result.append(line)
+        else:
+            result.append(yaml_snippet.rstrip('\n'))
+            inserted = True
+            in_proxies = False
+            result.append(line)
+    else:
+        result.append(line)
+
+if in_proxies and not inserted:
+    result.append(yaml_snippet.rstrip('\n'))
+
+with open(config_path, 'w') as f:
+    f.write('\n'.join(result))
+EOF
+    python3 /tmp/insert_proxy.py "$config" "$snippet"
+    rm -f /tmp/insert_proxy.py
 }
 
-# --- Python 解析脚本 ---
+run_insert_rule() {
+    local config=$1
+    local new_rule=$2
+    cat << 'EOF' > /tmp/insert_rule.py
+import sys
+config_path = sys.argv[1]
+new_rule = sys.argv[2]
+
+with open(config_path, 'r') as f:
+    lines = f.readlines()
+
+if not any(line.startswith('rules:') for line in lines):
+    lines.append('\nrules:\n')
+
+result = []
+inserted = False
+in_rules = False
+
+for line in lines:
+    if line.strip().startswith('- MATCH,'):
+        if not inserted:
+            result.append(new_rule + '\n')
+            inserted = True
+        result.append(line)
+        continue
+
+    if line.startswith('rules:'):
+        in_rules = True
+        result.append(line)
+        continue
+
+    if in_rules and not inserted:
+        if line.strip() == '' or line.strip().startswith('#') or line.startswith(' '):
+            result.append(line)
+        else:
+            result.append(new_rule + '\n')
+            inserted = True
+            in_rules = False
+            result.append(line)
+    else:
+        result.append(line)
+
+if in_rules and not inserted:
+    result.append(new_rule + '\n')
+
+with open(config_path, 'w') as f:
+    f.writelines(result)
+EOF
+    python3 /tmp/insert_rule.py "$config" "  - $new_rule"
+    rm -f /tmp/insert_rule.py
+}
+
 parse_link_py() {
-    python3 -c '
+    cat << 'EOF' > /tmp/parse_link.py
 import sys, urllib.parse, json, base64, re
 
 link = sys.argv[1]
@@ -150,7 +205,7 @@ try:
             result["tag_comment"] = urllib.parse.unquote(tag)
         
         if "@" in body:
-            userpass_part, hostport = body.split("@", 1)
+            userpass_part, hostport = body.rsplit("@", 1)
             method = ""
             password = ""
             decoded_success = False
@@ -175,7 +230,7 @@ try:
         else:
             decoded = b64decode(body)
             if "@" in decoded:
-                method_pass, host_port = decoded.split("@", 1)
+                method_pass, host_port = decoded.rsplit("@", 1)
                 if ":" in method_pass:
                     method, password = method_pass.split(":", 1)
                 host, port = host_port.split(":")
@@ -209,20 +264,55 @@ try:
 
 except Exception as e:
     print(json.dumps({"error": str(e)}))
-' "$1"
+EOF
+    python3 /tmp/parse_link.py "$1"
+    rm -f /tmp/parse_link.py
 }
 
-# --- 功能 2: 添加 Outbound (代理节点) ---
+# --- 功能 1: 安装 Geo 文件 ---
+install_geo_assets() {
+    local updater_script="/root/update_geo.sh"
+    local updater_url="https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/update_geo.sh"
+
+    info "正在拉取自动更新脚本 update_geo.sh ..."
+    if curl -fsSL -o "$updater_script" "$updater_url"; then
+        chmod +x "$updater_script"
+        info "脚本下载成功: $updater_script"
+    else
+        die "无法从 Github 下载更新脚本。"
+    fi
+
+    info "正在执行第一次 Geo 文件下载与安装..."
+    if "$updater_script"; then
+        info "初始化下载成功！"
+    else
+        die "初始化下载失败。"
+    fi
+    
+    info "设置 Crontab 定时任务 (每天凌晨 3:00 执行)..."
+    local cron_job="0 3 * * * $updater_script >> /var/log/update_geo.log 2>&1"
+    local tmp_cron; tmp_cron=$(mktemp)
+    crontab -l 2>/dev/null > "$tmp_cron" || true
+    sed -i '/update_geo.sh/d' "$tmp_cron"
+    echo "$cron_job" >> "$tmp_cron"
+    crontab "$tmp_cron"
+    rm -f "$tmp_cron"
+    
+    success "Geo 文件自动更新已配置完成！日志保存在: /var/log/update_geo.log"
+    pause
+}
+
+# --- 功能 2: 添加出站代理 ---
 add_outbound() {
     if [[ ! -f "$CONFIG_FILE" ]]; then die "配置文件不存在: $CONFIG_FILE"; fi
 
-    echo "================ 添加出站代理节点 ================"
+    echo "================ 添加 Outbounds (出站节点) ================"
     
     local tag
     while true; do
-        read -rp "请输入节点唯一名称: " tag
+        read -rp "请输入节点唯一名称 (Tag): " tag
         [[ -z "$tag" ]] && continue
-        if grep -q "name: $tag" "$CONFIG_FILE" 2>/dev/null; then
+        if grep -q "name: $tag" "$CONFIG_FILE" 2>/dev/null || grep -q "name: \"$tag\"" "$CONFIG_FILE" 2>/dev/null; then
             echo -e "${RED}名称 '$tag' 已存在，请使用其他名称。${PLAIN}"
         else
             break
@@ -230,183 +320,121 @@ add_outbound() {
     done
 
     echo "请选择节点类型:"
-    echo "  1) Shadowsocks (SS)"
-    echo "  2) VLESS"
-    read -rp "选择 (1-2): " type_choice
+    echo "  1) Socks"
+    echo "  2) Shadowsocks (SS)"
+    echo "  3) VLESS"
+    read -rp "选择 (1-3): " type_choice
+
+    local yaml_snippet=""
 
     case "$type_choice" in
-        1) # SS
+        1) # Socks
+            read -rp "地址 (Address): " addr
+            read -rp "端口 (Port): " port
+            read -rp "用户名 (User, 可留空): " user
+            read -rp "密码 (Pass, 可留空): " pass
+            
+yaml_snippet=$(cat <<EOF
+  - name: "${tag}"
+    type: socks5
+    server: ${addr}
+    port: ${port}
+    udp: true
+EOF
+)
+            if [[ -n "$user" ]]; then yaml_snippet+=$'\n'"    username: \"${user}\""; fi
+            if [[ -n "$pass" ]]; then yaml_snippet+=$'\n'"    password: \"${pass}\""; fi
+            ;;
+
+        2) # SS
             echo "添加方式: 1) 粘贴链接  2) 手动输入"
             read -rp "选择 (1/2): " ss_method_choice
+            local addr method pass port
             if [[ "$ss_method_choice" == "1" ]]; then
                 read -rp "请输入 SS 分享链接: " link
-                local parsed
-                parsed=$(parse_link_py "$link")
+                local parsed; parsed=$(parse_link_py "$link")
                 if echo "$parsed" | grep -q '"error"'; then
                     die "解析失败: $(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("error",""))')"
                 fi
-                local addr method pass port
                 addr=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin)["address"])')
                 port=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin)["port"])')
                 method=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin)["method"])')
                 pass=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin)["password"])')
                 info "解析成功: $method@$addr:$port"
             else
-                read -rp "地址: " addr
-                read -rp "端口: " port
-                echo "加密 (1-6): 1)aes-128-gcm 2)aes-256-gcm 3)chacha20 4)2022-blake3-aes-128 5)2022-blake3-aes-256 6)2022-blake3-chacha20"
+                read -rp "地址 (Address): " addr
+                read -rp "端口 (Port): " port
+                echo "加密 (1-6): 1)aes-128-gcm 2)aes-256-gcm 3)chacha20-ietf 4)2022-blake3-aes-128 5)2022-blake3-aes-256 6)2022-blake3-chacha20"
                 read -rp "选择: " m_idx
                 local methods=("aes-128-gcm" "aes-256-gcm" "chacha20-ietf-poly1305" "2022-blake3-aes-128-gcm" "2022-blake3-aes-256-gcm" "2022-blake3-chacha20-poly1305")
-                local method="${methods[$((m_idx-1))]}"
+                method="${methods[$((m_idx-1))]}"
                 [[ -z "$method" ]] && die "无效选择"
                 read -rp "密码: " pass
             fi
 
-            # 写入 proxies 段
-            python3 -c "
-import sys
-config_path = sys.argv[1]
-name = sys.argv[2]
-server = sys.argv[3]
-port = sys.argv[4]
-cipher = sys.argv[5]
-password = sys.argv[6]
-
-with open(config_path, 'r') as f:
-    content = f.read()
-
-proxy_block = '''
-  - name: \"{name}\"
+yaml_snippet=$(cat <<EOF
+  - name: "${tag}"
     type: ss
-    server: {server}
-    port: {port}
-    cipher: {cipher}
-    password: \"{password}\"
-    udp: true'''.format(name=name, server=server, port=port, cipher=cipher, password=password)
-
-import re
-if re.search(r'^proxies:\s*\[\]\s*$', content, re.MULTILINE):
-    content = re.sub(r'^proxies:\s*\[\]\s*$', 'proxies:' + proxy_block, content, flags=re.MULTILINE)
-elif re.search(r'^proxies:\s*$', content, re.MULTILINE):
-    content = re.sub(r'^proxies:\s*$', 'proxies:' + proxy_block, content, flags=re.MULTILINE)
-elif 'proxies:' in content:
-    lines = content.split('\n')
-    result_lines = []
-    in_proxies = False
-    inserted = False
-    for line in lines:
-        result_lines.append(line)
-        if line.startswith('proxies:'):
-            in_proxies = True; continue
-        if in_proxies and not inserted:
-            if line and not line.startswith(' ') and not line.startswith('#') and ':' in line:
-                result_lines.insert(len(result_lines) - 1, proxy_block.lstrip('\n'))
-                inserted = True; in_proxies = False
-    if in_proxies and not inserted:
-        result_lines.append(proxy_block.lstrip('\n'))
-    content = '\n'.join(result_lines)
-else:
-    content += '\nproxies:' + proxy_block + '\n'
-
-with open(config_path, 'w') as f:
-    f.write(content)
-" "$CONFIG_FILE" "$tag" "$addr" "$port" "$method" "$pass"
+    server: ${addr}
+    port: ${port}
+    cipher: ${method}
+    password: "${pass}"
+    udp: true
+EOF
+)
             ;;
 
-        2) # VLESS
+        3) # VLESS
             read -rp "请输入 VLESS 分享链接: " link
-            local parsed
-            parsed=$(parse_link_py "$link")
-            if echo "$parsed" | grep -q '"error"'; then
-                die "解析失败"
-            fi
+            local parsed; parsed=$(parse_link_py "$link")
+            if echo "$parsed" | grep -q '"error"'; then die "解析失败"; fi
             
-            local addr port uuid security sni pbk sid fp flow
+            local addr port uuid security sni pbk sid fp flow type
             addr=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin)["address"])')
             port=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin)["port"])')
             uuid=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin)["uuid"])')
             security=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("security","none"))')
+            encryption=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("encryption","none"))')
             sni=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("sni",""))')
             pbk=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("pbk",""))')
             sid=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("sid",""))')
             fp=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("fp","chrome"))')
             flow=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("flow",""))')
+            type=$(echo "$parsed" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("type","tcp"))')
             
-            info "解析成功: VLESS $uuid@$addr:$port (Sec: $security)"
+            info "解析成功: VLESS $uuid@$addr:$port (Sec: $security, Net: $type)"
 
-            python3 -c "
-import sys
-config_path = sys.argv[1]
-name = sys.argv[2]
-server = sys.argv[3]
-port = sys.argv[4]
-uuid = sys.argv[5]
-security = sys.argv[6]
-sni = sys.argv[7]
-pbk = sys.argv[8]
-sid = sys.argv[9]
-fp = sys.argv[10]
-flow = sys.argv[11]
-
-with open(config_path, 'r') as f:
-    content = f.read()
-
-proxy_block = '''
-  - name: \"{name}\"
+yaml_snippet=$(cat <<EOF
+  - name: "${tag}"
     type: vless
-    server: {server}
-    port: {port}
-    uuid: {uuid}
-    network: tcp
-    udp: true'''.format(name=name, server=server, port=port, uuid=uuid)
-
-if flow:
-    proxy_block += '\n    flow: ' + flow
-
-if security == 'reality':
-    proxy_block += '''
-    tls: true
-    servername: {sni}
-    client-fingerprint: {fp}
-    reality-opts:
-      public-key: {pbk}
-      short-id: {sid}'''.format(sni=sni, fp=fp, pbk=pbk, sid=sid)
-elif security == 'tls':
-    proxy_block += '''
-    tls: true
-    servername: {sni}'''.format(sni=sni)
-
-import re
-if re.search(r'^proxies:\s*\[\]\s*$', content, re.MULTILINE):
-    content = re.sub(r'^proxies:\s*\[\]\s*$', 'proxies:' + proxy_block, content, flags=re.MULTILINE)
-elif re.search(r'^proxies:\s*$', content, re.MULTILINE):
-    content = re.sub(r'^proxies:\s*$', 'proxies:' + proxy_block, content, flags=re.MULTILINE)
-elif 'proxies:' in content:
-    lines = content.split('\n')
-    result_lines = []
-    in_proxies = False
-    inserted = False
-    for line in lines:
-        result_lines.append(line)
-        if line.startswith('proxies:'):
-            in_proxies = True; continue
-        if in_proxies and not inserted:
-            if line and not line.startswith(' ') and not line.startswith('#') and ':' in line:
-                result_lines.insert(len(result_lines) - 1, proxy_block.lstrip('\n'))
-                inserted = True; in_proxies = False
-    if in_proxies and not inserted:
-        result_lines.append(proxy_block.lstrip('\n'))
-    content = '\n'.join(result_lines)
-else:
-    content += '\nproxies:' + proxy_block + '\n'
-
-with open(config_path, 'w') as f:
-    f.write(content)
-" "$CONFIG_FILE" "$tag" "$addr" "$port" "$uuid" "$security" "$sni" "$pbk" "$sid" "$fp" "$flow"
+    server: ${addr}
+    port: ${port}
+    uuid: ${uuid}
+    network: ${type}
+    udp: true
+EOF
+)
+            if [[ -n "$flow" && "$flow" != "none" ]]; then yaml_snippet+=$'\n'"    flow: ${flow}"; fi
+            if [[ -n "$encryption" && "$encryption" != "none" ]]; then 
+                yaml_snippet+=$'\n'"    encryption: \"${encryption}\""
+            fi
+            if [[ "$security" == "reality" ]]; then
+                yaml_snippet+=$'\n'"    tls: true"
+                yaml_snippet+=$'\n'"    servername: ${sni}"
+                yaml_snippet+=$'\n'"    client-fingerprint: ${fp}"
+                yaml_snippet+=$'\n'"    reality-opts:"
+                yaml_snippet+=$'\n'"      public-key: ${pbk}"
+                if [[ -n "$sid" ]]; then yaml_snippet+=$'\n'"      short-id: ${sid}"; fi
+            elif [[ "$security" == "tls" ]]; then
+                yaml_snippet+=$'\n'"    tls: true"
+                yaml_snippet+=$'\n'"    servername: ${sni}"
+                yaml_snippet+=$'\n'"    client-fingerprint: ${fp}"
+            fi
             ;;
         *) die "无效选择" ;;
     esac
 
+    run_insert_proxy "$CONFIG_FILE" "$yaml_snippet"
     info "已添加出站代理: $tag"
     restart_mihomo
     pause
@@ -416,39 +444,58 @@ with open(config_path, 'w') as f:
 add_routing() {
     if [[ ! -f "$CONFIG_FILE" ]]; then die "配置文件不存在"; fi
     
-    echo "================ 添加分流规则 ================"
-
-    echo "请选择规则类型:"
-    echo "  1) DOMAIN-SUFFIX (域名后缀)"
-    echo "  2) DOMAIN-KEYWORD (域名关键词)"
-    echo "  3) IP-CIDR (IP 段)"
-    echo "  4) GEOIP (地理 IP)"
-    echo "  5) GEOSITE (地理站点)"
-    read -rp "选择 (1-5): " rule_type_choice
+    echo "================ 添加分流规则 (Routing) ================"
+    echo "请选择分流规则类型:"
+    echo "  1) 指定入站名称 (IN-NAME)   <-- 纯链式代理转发专属"
+    echo "  2) 域名后缀 (DOMAIN-SUFFIX)"
+    echo "  3) 域名关键词 (DOMAIN-KEYWORD)"
+    echo "  4) IP 段 (IP-CIDR)"
+    echo "  5) 地理位置 (GEOIP)"
+    echo "  6) 站点集合 (GEOSITE)"
+    read -rp "选择 (1-6): " rule_type_choice
 
     local rule_prefix
+    local match_value
+
     case "$rule_type_choice" in
-        1) rule_prefix="DOMAIN-SUFFIX" ;;
-        2) rule_prefix="DOMAIN-KEYWORD" ;;
-        3) rule_prefix="IP-CIDR" ;;
-        4) rule_prefix="GEOIP" ;;
-        5) rule_prefix="GEOSITE" ;;
+        1) 
+            rule_prefix="IN-NAME"
+            echo "当前可用入站 (Listeners):"
+            python3 -c "
+with open('$CONFIG_FILE','r') as f:
+    content = f.read()
+in_listeners = False
+for line in content.split('\n'):
+    s = line.strip()
+    if s.startswith('listeners:'):
+        in_listeners = True; continue
+    elif in_listeners:
+        if s.startswith('- name:'):
+            name = s.split(':', 1)[1].strip().strip('\"').strip(\"'\")
+            print('  - ' + name)
+        elif s and not s.startswith(' ') and not s.startswith('-') and ':' in s:
+            break
+" 2>/dev/null || true
+            read -rp "请输入需要被转发的入站名称: " match_value
+            ;;
+        2) rule_prefix="DOMAIN-SUFFIX" ; read -rp "请输入匹配值 (如 google.com): " match_value ;;
+        3) rule_prefix="DOMAIN-KEYWORD" ; read -rp "请输入关键词 (如 google): " match_value ;;
+        4) rule_prefix="IP-CIDR" ; read -rp "请输入 IP 段 (如 8.8.8.8/32): " match_value ;;
+        5) rule_prefix="GEOIP" ; read -rp "请输入 GEOIP (如 cn): " match_value ;;
+        6) rule_prefix="GEOSITE" ; read -rp "请输入 GEOSITE (如 cn): " match_value ;;
         *) die "无效选择" ;;
     esac
 
-    read -rp "请输入匹配值 (如 google.com, cn, 8.8.8.8/32): " match_value
-    [[ -z "$match_value" ]] && die "值不能为空"
+    [[ -z "$match_value" ]] && die "匹配值不能为空"
 
-    echo "当前可用出站目标:"
+    echo "当前可用目标出站 (Proxies/DIRECT/REJECT):"
     echo "  - DIRECT (直连)"
     echo "  - REJECT (拒绝)"
-    # 列出 proxies 中的节点
-    if grep -q "^proxies:" "$CONFIG_FILE"; then
-        python3 -c "
+    python3 -c "
 with open('$CONFIG_FILE','r') as f:
-    content = f.read()
+    lines = f.readlines()
 in_proxies = False
-for line in content.split('\n'):
+for line in lines:
     s = line.strip()
     if s.startswith('proxies:'):
         in_proxies = True; continue
@@ -456,48 +503,18 @@ for line in content.split('\n'):
         if s.startswith('- name:'):
             name = s.split(':', 1)[1].strip().strip('\"').strip(\"'\")
             print('  - ' + name)
-        elif s and not s.startswith(' ') and not s.startswith('-') and ':' in s:
+        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
             break
 " 2>/dev/null || true
-    fi
 
-    read -rp "请输入目标出站: " target
+    local target
+    while true; do
+        read -rp "请输入最终指向的目标出站名称: " target
+        if [[ -n "$target" ]]; then break; fi
+    done
 
     local rule="${rule_prefix},${match_value},${target}"
-    
-    # 插入到 rules 段 (在 MATCH 之前)
-    python3 -c "
-import sys, re
-config_path = sys.argv[1]
-new_rule = sys.argv[2]
-
-with open(config_path, 'r') as f:
-    lines = f.readlines()
-
-result = []
-inserted = False
-for line in lines:
-    s = line.strip()
-    if not inserted and s.startswith('- MATCH,'):
-        result.append('  - ' + new_rule + '\n')
-        inserted = True
-    result.append(line)
-
-if not inserted:
-    # 没有 MATCH 规则，追加到 rules 段末尾
-    in_rules = False
-    result2 = []
-    for line in lines:
-        result2.append(line)
-        if line.strip().startswith('rules:'):
-            in_rules = True
-    if in_rules:
-        result2.append('  - ' + new_rule + '\n')
-    result = result2
-
-with open(config_path, 'w') as f:
-    f.writelines(result)
-" "$CONFIG_FILE" "$rule"
+    run_insert_rule "$CONFIG_FILE" "$rule"
 
     info "分流规则添加成功: $rule"
     restart_mihomo
@@ -506,29 +523,31 @@ with open(config_path, 'w') as f:
 
 # --- 功能 4: 查询 Listeners ---
 query_listeners() {
-    echo "================ Listeners 列表 ================"
+    echo "================ Listeners (入站) 列表 ================"
     python3 -c "
 with open('$CONFIG_FILE','r') as f:
-    content = f.read()
+    lines = f.readlines()
 in_listeners = False
 current = {}
-for line in content.split('\n'):
+print(f\"  {'Tag/名称':25s} {'Type/类型':15s} {'Port/端口'}\")
+print(\"  \" + \"-\"*50)
+for line in lines:
     s = line.strip()
     if s.startswith('listeners:'):
         in_listeners = True; continue
     if in_listeners:
         if s.startswith('- name:'):
             if current:
-                print(f\"  {current.get('name','?'):20s} {current.get('type','?'):15s} {current.get('port','?')}\")
-            current = {'name': s.split(':',1)[1].strip()}
+                print(f\"  {current.get('name','?'):25s} {current.get('type','?'):15s} {current.get('port','?')}\")
+            current = {'name': s.split(':',1)[1].strip().strip('\"').strip(\"'\")}
         elif s.startswith('type:'):
             current['type'] = s.split(':',1)[1].strip()
         elif s.startswith('port:'):
             current['port'] = s.split(':',1)[1].strip()
-        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#') and ':' in s:
+        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
             break
 if current:
-    print(f\"  {current.get('name','?'):20s} {current.get('type','?'):15s} {current.get('port','?')}\")
+    print(f\"  {current.get('name','?'):25s} {current.get('type','?'):15s} {current.get('port','?')}\")
 " 2>/dev/null || echo "  (无)"
     pause
 }
@@ -538,10 +557,12 @@ query_proxies() {
     echo "================ Proxies (出站代理) 列表 ================"
     python3 -c "
 with open('$CONFIG_FILE','r') as f:
-    content = f.read()
+    lines = f.readlines()
 in_proxies = False
 current = {}
-for line in content.split('\n'):
+print(f\"  {'Tag/名称':20s} {'Type/类型':15s} {'Address/地址':25s} {'Port/端口'}\")
+print(\"  \" + \"-\"*75)
+for line in lines:
     s = line.strip()
     if s.startswith('proxies:'):
         in_proxies = True; continue
@@ -549,14 +570,14 @@ for line in content.split('\n'):
         if s.startswith('- name:'):
             if current:
                 print(f\"  {current.get('name','?'):20s} {current.get('type','?'):15s} {current.get('server','N/A'):25s} {current.get('port','N/A')}\")
-            current = {'name': s.split(':',1)[1].strip().strip('\"')}
+            current = {'name': s.split(':',1)[1].strip().strip('\"').strip(\"'\")}
         elif s.startswith('type:'):
             current['type'] = s.split(':',1)[1].strip()
         elif s.startswith('server:'):
-            current['server'] = s.split(':',1)[1].strip()
+            current['server'] = s.split(':',1)[1].strip().strip('\"').strip(\"'\")
         elif s.startswith('port:'):
             current['port'] = s.split(':',1)[1].strip()
-        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#') and ':' in s:
+        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
             break
 if current:
     print(f\"  {current.get('name','?'):20s} {current.get('type','?'):15s} {current.get('server','N/A'):25s} {current.get('port','N/A')}\")
@@ -569,18 +590,20 @@ query_rules() {
     echo "================ Rules (路由规则) ================"
     python3 -c "
 with open('$CONFIG_FILE','r') as f:
-    content = f.read()
+    lines = f.readlines()
 in_rules = False
 idx = 0
-for line in content.split('\n'):
+print(\"  ID  | 规则 (Rule)\")
+print(\"  ------------------------------------------------\")
+for line in lines:
     s = line.strip()
     if s.startswith('rules:'):
         in_rules = True; continue
     if in_rules:
         if s.startswith('- '):
             idx += 1
-            print(f'  {idx:3d}. {s[2:]}')
-        elif s and not s.startswith(' ') and not s.startswith('#') and ':' in s:
+            print(f'  {idx:3d} | {s[2:]}')
+        elif s and not s.startswith(' ') and not s.startswith('#'):
             break
 " 2>/dev/null || echo "  (无)"
     pause
@@ -603,11 +626,11 @@ update_script() {
 show_menu() {
     clear
     echo "================================================="
-    echo "       Caesar 蜜汁 Mihomo 服务端分流脚本 v1.0     "
+    echo "       Caesar 蜜汁 Mihomo 服务端分流脚本 v2.0     "
     echo "================================================="
     echo
     echo "  1. 安装 Geo 文件 (配置每日自动更新)"
-    echo "  2. 添加出站代理 (SS / VLESS)"
+    echo "  2. 添加出站代理 (Socks / SS / VLESS)"
     echo "  3. 添加分流规则 (Routing)"
     echo "  4. 查询已有 Listeners (入站)"
     echo "  5. 查询已有 Proxies (出站)"
