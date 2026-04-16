@@ -1,12 +1,13 @@
-[中文](/README.md)
+[中文](/README.md) | [English](/README_en_US.md) | [日本語](/README_ja_JP.md) | [Русский](/README_ru_RU.md) 
 
 # Caesar 蜜汁 Mihomo 一键安装与管理工具箱 (Install-Mihomo-Inbounds)
 
-这是一个功能强大、高度模块化且极具兼容性的 Mihomo 节点安装与管理脚本集合。使用 Mihomo (Meta Kernel) 替代 Xray 作为代理服务端核心，解决 Xray 存在的 TCP 连接数泄露问题。支持在一台服务器上完美共存部署多种主流协议（VLESS-Reality、Shadowsocks 2022 等），并提供便捷的配置备份、路由分流管理以及 Geo 数据更新功能。
+这是一个功能强大、高度模块化且极具兼容性的 Mihomo 节点安装与管理脚本集合。使用 Mihomo (Meta Kernel) 替代 Xray 作为代理服务端核心，解决 Xray 存在的 TCP 连接数泄露问题。支持在一台服务器上完美共存部署多种主流协议（VLESS-Reality、VLESS Encryption、Shadowsocks 2022 等），并提供便捷的配置备份、路由分流管理以及 Geo 数据更新功能。
 
 ## ✨ 核心特性
 
-* **Mihomo 核心**：使用 Mihomo (Clash Meta) 作为代理服务端，解决 Xray 的 TCP 连接数泄露 Bug，资源占用更低，稳定性更强。
+* **Mihomo 核心**：使用 Mihomo (Clash Meta) 作为代理服务端，解决 Xray 的 TCP 连接数泄露 Bug，资源占用更低，稳定性更强。同时支持针对老旧 CPU 的 `amd64-compatible` 架构指令集降级适配。
+* **抗量子加密支持**：无缝支持 Xray 首创的 VLESS Encryption (ML-KEM-768, Post-Quantum) 特性，并提供高度兼容的密钥自动转换生成。
 * **多协议智能共存**：采用 Python 解析 YAML 配置并智能追加 listeners，随心所欲安装多个不同协议或多端口节点，**绝对不会覆盖**原有节点配置。
 * **极致的系统兼容**：不仅完美支持 Debian / Ubuntu 等基于 Systemd 的主流系统，更**深度兼容 Alpine Linux (OpenRC)**，对极其精简的轻量级系统同样友好。
 * **NAT / DDNS 友好**：内置独立连接地址自定义功能，无论你是使用 NAT 动态端口机，还是通过 DDNS 域名解析，都能一键生成正确的分享链接。
@@ -22,7 +23,7 @@
 执行以下命令即可下载并唤出全局管理菜单：
 
 ```bash
-curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_manager.sh -o mihomo_manager.sh && chmod +x mihomo_manager.sh && sudo ./mihomo_manager.sh
+curl -L [https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_manager.sh](https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_manager.sh) -o mihomo_manager.sh && chmod +x mihomo_manager.sh && sudo ./mihomo_manager.sh
 ```
 
 **💡 贴心提示：**
@@ -39,36 +40,42 @@ mihomo-manager
 
 如果你只想使用本项目的某一个特定功能，也可以直接使用以下独立安装命令。
 
-### 1. VLESS-Reality (Vision) 节点管理
+### 1. VLESS Encryption (Post-Quantum) 节点管理
+支持最新一代 ML-KEM-768 抗量子加密技术，抛弃冗杂配置，仅需握手密钥即可建立安全连接。
+```bash
+curl -L [https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_vless_encryption.sh](https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_vless_encryption.sh) -o install_vless_encryption.sh && chmod +x install_vless_encryption.sh && sudo ./install_vless_encryption.sh
+```
+
+### 2. VLESS-Reality (Vision) 节点管理
 支持自动生成 X25519 密钥对，默认使用 `xtls-rprx-vision` 流控，使用 Mihomo 的 listeners 接入。
 ```bash
-curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_vless_reality.sh -o install_vless_reality.sh && chmod +x install_vless_reality.sh && sudo ./install_vless_reality.sh
+curl -L [https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_vless_reality.sh](https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_vless_reality.sh) -o install_vless_reality.sh && chmod +x install_vless_reality.sh && sudo ./install_vless_reality.sh
 ```
 
-### 2. Shadowsocks 2022 & 传统 SS 节点管理
+### 3. Shadowsocks 2022 & 传统 SS 节点管理
 支持极速的 2022-blake3-aes 等新一代加密协议，并向下兼容传统的 aes-gcm 加密，自动生成强随机密码。
 ```bash
-curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_ss2022.sh -o install_ss2022.sh && chmod +x install_ss2022.sh && sudo ./install_ss2022.sh
+curl -L [https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_ss2022.sh](https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/install_ss2022.sh) -o install_ss2022.sh && chmod +x install_ss2022.sh && sudo ./install_ss2022.sh
 ```
 
-### 3. 服务端路由分流工具 (Mihomo Routing)
+### 4. 服务端路由分流工具 (Mihomo Routing)
 强大的服务端出口分流控制面板。支持解析 SS 和 VLESS 分享链接，可视化配置分流规则。
 ```bash
-curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_routing.sh -o mihomo_routing.sh && chmod +x mihomo_routing.sh && sudo ./mihomo_routing.sh
+curl -L [https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_routing.sh](https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_routing.sh) -o mihomo_routing.sh && chmod +x mihomo_routing.sh && sudo ./mihomo_routing.sh
 ```
 *安装后随时可用 `mihomo-routing` 命令唤起。*
 
-### 4. 备份与还原工具 (Mihomo Restore)
+### 5. 备份与还原工具 (Mihomo Restore)
 不小心改错了配置？想要迁移配置？使用此工具可以通过直链 URL 导入配置文件，或者打开控制台手动粘贴 `config.yaml`，自带安全测试防报错功能。
 ```bash
-curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_restore.sh -o mihomo_restore.sh && chmod +x mihomo_restore.sh && sudo ./mihomo_restore.sh
+curl -L [https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_restore.sh](https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_restore.sh) -o mihomo_restore.sh && chmod +x mihomo_restore.sh && sudo ./mihomo_restore.sh
 ```
 *安装后随时可用 `mihomo-restore` 命令唤起。*
 
-### 5. 完全卸载工具
+### 6. 完全卸载工具
 如果你遇到无法解决的严重问题，或者想要完全清理服务器，可以使用此脚本。它会极其干净地清理系统服务（Systemd/OpenRC）、二进制文件、日志以及残留配置。
 ```bash
-curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/uninstall_mihomo.sh -o uninstall_mihomo.sh && chmod +x uninstall_mihomo.sh && sudo ./uninstall_mihomo.sh
+curl -L [https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/uninstall_mihomo.sh](https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/uninstall_mihomo.sh) -o uninstall_mihomo.sh && chmod +x uninstall_mihomo.sh && sudo ./uninstall_mihomo.sh
 ```
 
 ---
@@ -77,16 +84,16 @@ curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/
 
 | Xray 脚本 | Mihomo 脚本 | 功能 |
 |---|---|---|
-| `install_ss2022.sh` | `install_ss2022.sh` | Shadowsocks 2022 节点管理 |
+| `install_vless_encryption.sh` | `install_vless_encryption.sh` | VLESS Encryption (PQ) 节点管理 |
 | `install_vless_reality.sh` | `install_vless_reality.sh` | VLESS-Reality 节点管理 |
-| `install_vless_encryption.sh` | *(暂不支持)* | VLESS Encryption (Post-Quantum) |
+| `install_ss2022.sh` | `install_ss2022.sh` | Shadowsocks 2022 节点管理 |
 | `xray_manager.sh` | `mihomo_manager.sh` | 统一管理菜单 |
 | `xray_routing.sh` | `mihomo_routing.sh` | 服务端分流配置 |
 | `xray_restore.sh` | `mihomo_restore.sh` | 配置备份还原 |
 | `uninstall_xray.sh` | `uninstall_mihomo.sh` | 完全卸载 |
 | `update_geo.sh` | `update_geo.sh` | Geo 数据更新 |
 
-> **注意**: VLESS Encryption (Post-Quantum / ML-KEM-768) 是 Xray 独有的前沿功能，Mihomo 目前不支持此协议。如需使用该协议，请继续使用 Xray 版本。
+> **提示**: Mihomo 已全面支持 VLESS 的各项新特性，包括 Reality 和基于 ML-KEM-768 的 Encryption 协议，本工具箱中的所有组件均可在此框架下正常使用。
 
 ---
 
@@ -94,11 +101,15 @@ curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/
 
 **Q: 为什么要从 Xray 迁移到 Mihomo？**
 
-**A:** Xray 代理服务端存在严重的 TCP 连接数泄露 Bug。Mihomo (Meta Kernel) 不存在此问题，且在资源占用和稳定性方面表现更优。
+**A:** Xray 代理服务端存在严重的 TCP 连接数泄露 Bug。Mihomo (Meta Kernel) 不存在此问题，且在资源占用和稳定性方面表现更优，尤其适合并发较高的商用环境或合租机器。
 
 **Q: 我的服务器是 NAT VPS，或者入口 IP 跟出口 IP 不一样，生成的节点不通怎么办？**
 
 **A:** 请在任意安装菜单中选择 **"设置连接地址 (NAT/DDNS)"** 选项。填入你实际用于外部连接的 IP 地址或 DDNS 域名。
+
+**Q: 我的旧款 E5 处理器装不上新版，报错不支持 v3 架构怎么办？**
+
+**A:** 本仓库中的安装脚本已经对 CPU 架构识别进行了智能优化。针对不支持 AVX2 指令集的老旧硬件（如部分 E5 v2、Atom 处理器），脚本会自动拉取 `amd64-compatible` 兼容版内核，避免安装失败。
 
 **Q: 如何查看 Mihomo 的运行日志？**
 
