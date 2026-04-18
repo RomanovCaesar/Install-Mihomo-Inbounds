@@ -418,7 +418,8 @@ for line in lines:
     if stripped == '- name: ' + target_name:
         skip = True; continue
     if skip:
-        if stripped.startswith('- name:') or (stripped and not stripped.startswith(' ') and not stripped.startswith('-') and ':' in stripped and not stripped.startswith('#')):
+        # 核心修复：使用原始的 line 变量来判断真实的缩进，防止误判
+        if stripped.startswith('- name:') or (stripped and not line.startswith(' ') and not line.startswith('-') and ':' in stripped and not stripped.startswith('#')):
             skip = False; result.append(line)
         else: continue
     else: result.append(line)
@@ -726,13 +727,15 @@ config_path = sys.argv[1]
 target_name = 'vless-reality-in-' + sys.argv[2]
 with open(config_path, 'r') as f:
     lines = f.readlines()
-result = []; skip = False
+result = []
+skip = False
 for line in lines:
     stripped = line.strip()
     if stripped == '- name: ' + target_name:
         skip = True; continue
     if skip:
-        if stripped.startswith('- name:') or (stripped and not stripped.startswith(' ') and not stripped.startswith('-') and ':' in stripped and not stripped.startswith('#')):
+        # 核心修复：使用原始的 line 变量来判断真实的缩进，防止误判
+        if stripped.startswith('- name:') or (stripped and not line.startswith(' ') and not line.startswith('-') and ':' in stripped and not stripped.startswith('#')):
             skip = False; result.append(line)
         else: continue
     else: result.append(line)
