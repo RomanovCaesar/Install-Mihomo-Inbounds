@@ -312,7 +312,7 @@ listener_block = f'''
     listen: 0.0.0.0
     users:
       - uuid: {uuid}
-        encryption: \"{dec_key}\"'''
+    decryption: \"{dec_key}\"'''
 
 if re.search(r'^listeners:\s*\[\]\s*$', content, re.MULTILINE):
     content = re.sub(r'^listeners:\s*\[\]\s*$', 'listeners:' + listener_block, content, flags=re.MULTILINE)
