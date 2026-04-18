@@ -429,7 +429,7 @@ with open(config_path, 'w') as f:
     f.writelines(result)
 " "$mihomo_config_path" "$target_p"
 
-    local link_file="/root/mihomo_vless_encryption_link_${target_port}.txt"
+    local link_file="/root/mihomo_vless_encryption_link_${target_p}.txt"
     [[ -f "$link_file" ]] && rm -f "$link_file"
 
     service_restart
