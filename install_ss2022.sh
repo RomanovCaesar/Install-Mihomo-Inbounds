@@ -78,8 +78,10 @@ install_mihomo_core() {
     case "$machine" in
         x86_64|amd64) arch="amd64-compatible" ;;
         aarch64|arm64) arch="arm64" ;;
+        armv7|armv7l) arch="armv7" ;;
         *) error "不支持的 CPU 架构: $machine"; return 1 ;;
     esac
+    [[ "$arch" == "armv7" ]] && echo -e "\n${yellow}[!] 警告: ARMv7 支持目前处于 Alpha 阶段，二进制来自预发布版本，可能存在不稳定情况，请谨慎使用。${none}\n"
 
     local api="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
     info "获取 Mihomo 最新版本信息..."
