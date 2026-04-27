@@ -473,7 +473,7 @@ for line in content.split('\n'):
         if s.startswith('- name:'):
             name = s.split(':', 1)[1].strip().strip('\"').strip(\"'\")
             print('  - ' + name)
-        elif s and not s.startswith(' ') and not s.startswith('-') and ':' in s:
+        elif s and not line.startswith(' ') and not s.startswith('-') and ':' in s:
             break
 " 2>/dev/null || true
             read -rp "请输入需要被转发的入站名称: " match_value
@@ -503,7 +503,7 @@ for line in lines:
         if s.startswith('- name:'):
             name = s.split(':', 1)[1].strip().strip('\"').strip(\"'\")
             print('  - ' + name)
-        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
+        elif s and not line.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
             break
 " 2>/dev/null || true
 
@@ -544,7 +544,7 @@ for line in lines:
             current['type'] = s.split(':',1)[1].strip()
         elif s.startswith('port:'):
             current['port'] = s.split(':',1)[1].strip()
-        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
+        elif s and not line.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
             break
 if current:
     print(f\"  {current.get('name','?'):25s} {current.get('type','?'):15s} {current.get('port','?')}\")
@@ -577,7 +577,7 @@ for line in lines:
             current['server'] = s.split(':',1)[1].strip().strip('\"').strip(\"'\")
         elif s.startswith('port:'):
             current['port'] = s.split(':',1)[1].strip()
-        elif s and not s.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
+        elif s and not line.startswith(' ') and not s.startswith('-') and not s.startswith('#'):
             break
 if current:
     print(f\"  {current.get('name','?'):20s} {current.get('type','?'):15s} {current.get('server','N/A'):25s} {current.get('port','N/A')}\")
@@ -603,7 +603,7 @@ for line in lines:
         if s.startswith('- '):
             idx += 1
             print(f'  {idx:3d} | {s[2:]}')
-        elif s and not s.startswith(' ') and not s.startswith('#'):
+        elif s and not line.startswith(' ') and not s.startswith('#'):
             break
 " 2>/dev/null || echo "  (无)"
     pause
