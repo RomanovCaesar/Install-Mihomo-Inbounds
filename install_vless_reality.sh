@@ -167,15 +167,40 @@ setup_service() {
 # --- 验证函数 ---
 is_valid_port() { local port=$1; [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; }
 
+is_listener_port_in_config() {
+    local port=$1
+    [[ -f "$mihomo_config_path" ]] || return 1
+
+    # 只检查 listeners 顶级配置段。proxies 中的 port 是远端目标端口，
+    # 不会在本机监听，因此不能据此判定本地端口冲突。
+    awk -v target="$port" '
+        BEGIN { in_listeners = 0; found = 0 }
+        /^[^[:space:]#][^:]*:/ {
+            key = $0
+            sub(/:.*/, "", key)
+            in_listeners = (key == "listeners")
+            next
+        }
+        in_listeners && /^[[:space:]]+port:[[:space:]]*/ {
+            value = $0
+            sub(/^[[:space:]]+port:[[:space:]]*/, "", value)
+            sub(/[[:space:]]*#.*/, "", value)
+            gsub(/[[:space:]\"]/, "", value)
+            quote = sprintf("%c", 39)
+            gsub(quote, "", value)
+            if (value == target) found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$mihomo_config_path" 2>/dev/null
+}
+
 is_port_in_use() {
     local port=$1
     if command -v ss &>/dev/null; then ss -tuln 2>/dev/null | grep -q ":$port " && return 0
     elif command -v netstat &>/dev/null; then netstat -tuln 2>/dev/null | grep -q ":$port " && return 0
-    elif command -v lsof &>/dev/null; then lsof -i ":$port" &>/dev/null
+    elif command -v lsof &>/dev/null; then lsof -i ":$port" &>/dev/null && return 0
     else (echo > "/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1 && return 0; fi
-    if [[ -f "$mihomo_config_path" ]]; then
-         grep -qE "^\s+port:\s+$port\s*$" "$mihomo_config_path" 2>/dev/null && return 0
-    fi
+    is_listener_port_in_config "$port" && return 0
     return 1
 }
 
