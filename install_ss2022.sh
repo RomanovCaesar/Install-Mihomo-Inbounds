@@ -35,8 +35,8 @@ INIT_SYSTEM=""
 
 # --- 辅助函数 ---
 error() { echo -e "\n${red}[✖] $1${none}\n" >&2; }
-info()  { [[ "$is_quiet" = false ]] && echo -e "\n${yellow}[!] $1${none}\n"; }
-success(){ [[ "$is_quiet" = false ]] && echo -e "\n${green}[✔] $1${none}\n"; }
+info()  { if [[ "$is_quiet" = false ]]; then echo -e "\n${yellow}[!] $1${none}\n"; fi; return 0; }
+success(){ if [[ "$is_quiet" = false ]]; then echo -e "\n${green}[✔] $1${none}\n"; fi; return 0; }
 
 spinner() {
     local pid=$1; local spinstr='|/-\\'
@@ -69,6 +69,29 @@ get_public_ip() {
     error "无法获取公网 IP 地址。" && return 1
 }
 
+normalize_connection_address() {
+    python3 - "$1" <<'PY'
+import ipaddress, re, sys
+value = sys.argv[1].strip()
+if value.startswith('[') and value.endswith(']'):
+    value = value[1:-1]
+try:
+    print(ipaddress.ip_address(value).compressed)
+except ValueError:
+    if len(value) > 253 or not re.fullmatch(r'(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', value):
+        raise SystemExit(1)
+    print(value.rstrip('.'))
+PY
+}
+
+format_uri_host() {
+    if [[ "$1" == *:* ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
+}
+
+url_encode() {
+    python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
 # --- 核心安装逻辑 ---
 install_mihomo_core() {
     info "开始安装 Mihomo 核心..."
@@ -91,7 +114,7 @@ install_mihomo_core() {
     local version_str="${tag:-latest}"
     info "目标版本: $version_str"
 
-    local tmpdir; tmpdir="$(mktemp -d)"
+    local tmpdir; tmpdir="$(mktemp -d)" || return 1
     local filename="mihomo-linux-${arch}-${tag}.gz"
     local url_tag="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/${filename}"
     local url_alt="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-${arch}.gz"
@@ -106,10 +129,14 @@ install_mihomo_core() {
     fi
 
     info "解压并安装到 /usr/local/bin ..."
-    gzip -d "$tmpdir/mihomo.gz"
-    install -m 0755 "$tmpdir/mihomo" "$mihomo_binary_path"
+    if ! gzip -d "$tmpdir/mihomo.gz" || ! chmod +x "$tmpdir/mihomo" || ! "$tmpdir/mihomo" -v >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        error "下载的 Mihomo 核心无法执行，已取消安装。"
+        return 1
+    fi
+    install -m 0755 "$tmpdir/mihomo" "$mihomo_binary_path" || { rm -rf "$tmpdir"; return 1; }
     
-    mkdir -p "$mihomo_config_dir"
+    mkdir -p "$mihomo_config_dir" || return 1
     
     rm -rf "$tmpdir"
     success "Mihomo 核心安装完成"
@@ -117,8 +144,22 @@ install_mihomo_core() {
 
 install_geodata() {
     info "正在安装/更新 GeoIP 和 GeoSite 数据文件..."
-    curl -fsSL -o "${mihomo_config_dir}/geoip.metadb" https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.metadb
-    curl -fsSL -o "${mihomo_config_dir}/geosite.dat" https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+    mkdir -p "$mihomo_config_dir" || return 1
+    local tmpdir
+    tmpdir="$(mktemp -d "${mihomo_config_dir}/.geo-install.XXXXXX")" || return 1
+    if ! curl -fsSL -o "$tmpdir/geoip.metadb" https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.metadb \
+        || ! curl -fsSL -o "$tmpdir/geosite.dat" https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat \
+        || [[ ! -s "$tmpdir/geoip.metadb" || ! -s "$tmpdir/geosite.dat" ]]; then
+        rm -rf "$tmpdir"
+        error "Geo 数据文件下载失败，原文件未被覆盖。"
+        return 1
+    fi
+    chmod 0644 "$tmpdir/geoip.metadb" "$tmpdir/geosite.dat"
+    if ! mv -f "$tmpdir/geoip.metadb" "${mihomo_config_dir}/geoip.metadb" \
+        || ! mv -f "$tmpdir/geosite.dat" "${mihomo_config_dir}/geosite.dat"; then
+        rm -rf "$tmpdir"; error "Geo 数据文件安装失败。"; return 1
+    fi
+    rm -rf "$tmpdir"
     success "Geo 数据文件已更新"
 }
 
@@ -144,8 +185,9 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now mihomo
+    [[ -s /etc/systemd/system/mihomo.service ]] || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable --now mihomo || return 1
     success "Systemd 服务已安装并启动"
 }
 
@@ -169,9 +211,10 @@ depend() {
   use dns
 }
 EOF
-    chmod +x /etc/init.d/mihomo
-    rc-update add mihomo default
-    rc-service mihomo restart || rc-service mihomo start
+    [[ -s /etc/init.d/mihomo ]] || return 1
+    chmod +x /etc/init.d/mihomo || return 1
+    rc-update add mihomo default || return 1
+    rc-service mihomo restart || rc-service mihomo start || return 1
     success "OpenRC 服务已安装并启动"
 }
 
@@ -182,6 +225,38 @@ setup_service() {
         install_service_openrc
     else
         error "无法确定服务管理器，请手动配置自启动。"
+        return 1
+    fi
+}
+
+service_restart() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl restart mihomo || return 1
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        rc-service mihomo restart || return 1
+    else
+        error "无法确定服务管理器，请手动重启 Mihomo。"
+        return 1
+    fi
+    sleep 1
+    service_is_active
+}
+
+service_is_active() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl is-active --quiet mihomo
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        rc-service mihomo status 2>/dev/null | grep -qi started
+    else
+        return 1
+    fi
+}
+
+validate_mihomo_config() {
+    if [[ -x "$mihomo_binary_path" ]]; then
+        "$mihomo_binary_path" -t -d "$mihomo_config_dir"
+    else
+        return 0
     fi
 }
 
@@ -218,6 +293,122 @@ is_listener_port_in_config() {
     ' "$mihomo_config_path" 2>/dev/null
 }
 
+managed_listener_ports() {
+    local prefix=$1
+    [[ -f "$mihomo_config_path" ]] || return 1
+    python3 - "$mihomo_config_path" "$prefix" <<'PY'
+import json, re, sys
+path, prefix = sys.argv[1:]
+in_listeners = False
+current_name = None
+
+def scalar(value):
+    value = value.strip()
+    try:
+        return str(json.loads(value))
+    except Exception:
+        return value.strip("\"'")
+
+with open(path, encoding='utf-8') as f:
+    for raw in f:
+        if re.match(r'^[^\s#][^:]*:', raw):
+            in_listeners = raw.split(':', 1)[0].strip() == 'listeners'
+            current_name = None
+            continue
+        if not in_listeners:
+            continue
+        stripped = raw.strip()
+        if stripped.startswith('- name:'):
+            current_name = scalar(stripped.split(':', 1)[1])
+        elif current_name and current_name.startswith(prefix) and stripped.startswith('port:'):
+            value = scalar(stripped.split(':', 1)[1])
+            if value.isdigit() and current_name == prefix + value:
+                print(value)
+PY
+}
+
+backup_config() {
+    local suffix="${1:-bak}"
+    local backup
+    backup=$(mktemp "${mihomo_config_path}.${suffix}.$(date +%Y%m%d%H%M%S).XXXXXX") || return 1
+    cp "$mihomo_config_path" "$backup" || { rm -f "$backup"; return 1; }
+    chmod 600 "$backup"
+    printf '%s\n' "$backup"
+}
+
++backup_config_archive() {
+    [[ -d "$mihomo_config_dir" ]] || return 0
+    local archive
+    archive=$(mktemp "/root/mihomo-config-backup-$(date +%Y%m%d%H%M%S).XXXXXX.tar.gz") || return 1
+    if ! tar -czf "$archive" -C "$(dirname "$mihomo_config_dir")" "$(basename "$mihomo_config_dir")"; then
+        rm -f "$archive"
+        return 1
+    fi
+    chmod 600 "$archive" || return 1
+    printf '%s\n' "$archive"
+}
+
+remove_managed_listener() {
+    local prefix=$1 port=$2
+    python3 - "$mihomo_config_path" "$prefix" "$port" <<'PY'
+import json, os, re, stat, sys, tempfile
+path, prefix, port = sys.argv[1:]
+target_name = prefix + port
+in_listeners = False
+skip = False
+skip_indent = -1
+removed = False
+result = []
+
+def scalar(value):
+    value = value.strip()
+    try:
+        return str(json.loads(value))
+    except Exception:
+        return value.strip("\"'")
+
+with open(path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+for raw in lines:
+    if re.match(r'^[^\s#][^:]*:', raw):
+        skip = False
+        in_listeners = raw.split(':', 1)[0].strip() == 'listeners'
+        result.append(raw)
+        continue
+
+    stripped = raw.strip()
+    indent = len(raw) - len(raw.lstrip())
+    if in_listeners and stripped.startswith('- name:'):
+        if skip and indent <= skip_indent:
+            skip = False
+        name = scalar(stripped.split(':', 1)[1])
+        if not skip and name == target_name:
+            skip = True
+            skip_indent = indent
+            removed = True
+            continue
+
+    if skip:
+        continue
+    result.append(raw)
+
+if not removed:
+    raise SystemExit(2)
+
+directory = os.path.dirname(path) or '.'
+fd, tmp = tempfile.mkstemp(prefix='.config.', dir=directory, text=True)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.writelines(result)
+    os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
 is_port_in_use() {
     local port=$1
     # 检查系统监听
@@ -242,7 +433,7 @@ detect_system() {
         . /etc/os-release
         OS_ID=${ID:-}
     fi
-    if command -v systemctl >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
         INIT_SYSTEM="systemd"
     elif command -v rc-service >/dev/null 2>&1; then
         INIT_SYSTEM="openrc"
@@ -255,7 +446,7 @@ check_system_compatibility() {
     if [[ "$(uname -s)" != "Linux" ]]; then error "仅支持 Linux"; return 1; fi
     detect_system
     
-    local required_commands=("awk" "grep" "sed" "curl" "openssl")
+    local required_commands=("awk" "grep" "sed" "curl" "openssl" "python3" "gzip" "base64" "install" "mktemp" "tar")
     local missing_commands=()
     for cmd in "${required_commands[@]}"; do
         command -v "$cmd" >/dev/null 2>&1 || missing_commands+=("$cmd")
@@ -263,28 +454,30 @@ check_system_compatibility() {
     if [[ ${#missing_commands[@]} -gt 0 ]]; then
         info "正在安装缺失依赖: ${missing_commands[*]} ..."
         if [[ "$OS_ID" == "alpine" ]]; then
-            apk add --no-cache "${missing_commands[@]}" bash iproute2 coreutils gzip
+            apk add --no-cache bash curl python3 openssl iproute2 coreutils gzip
         elif command -v apt-get >/dev/null; then
-            DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_commands[@]}" gzip
+            DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash curl python3 openssl iproute2 coreutils gzip
+        else
+            error "当前系统不支持自动安装依赖: ${missing_commands[*]}"
+            return 1
         fi
     fi
+    for cmd in "${required_commands[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || { error "缺少必要命令: $cmd"; return 1; }
+    done
     return 0
 }
 
 pre_check() {
     [[ $(id -u) != 0 ]] && error "必须以 root 运行" && exit 1
-    check_system_compatibility
+    check_system_compatibility || exit 1
 }
 
 check_mihomo_status() {
     if [[ ! -f "$mihomo_binary_path" ]]; then mihomo_status_info="  Mihomo 状态: ${red}未安装${none}"; return; fi
     local mihomo_version=$($mihomo_binary_path -v 2>/dev/null | head -n 1 | awk '{print $3}' || echo "未知")
-    local service_status
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        systemctl is-active --quiet mihomo && service_status="${green}运行中${none}" || service_status="${yellow}未运行${none}"
-    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        rc-service mihomo status 2>/dev/null | grep -qi started && service_status="${green}运行中${none}" || service_status="${yellow}未运行${none}"
-    fi
+    local service_status="${yellow}未运行/无法检测${none}"
+    service_is_active && service_status="${green}运行中${none}"
     mihomo_status_info="  Mihomo 状态: ${green}已安装${none} | ${service_status} | 版本: ${cyan}${mihomo_version}${none}"
 }
 
@@ -329,7 +522,7 @@ select_method_and_password() {
 init_mihomo_config() {
     if [[ ! -f "$mihomo_config_path" ]]; then
         info "配置文件不存在，创建新配置..."
-        mkdir -p "$mihomo_config_dir"
+        mkdir -p "$mihomo_config_dir" || return 1
         cat > "$mihomo_config_path" <<'YAML'
 # Mihomo 代理服务端配置
 mode: rule
@@ -342,6 +535,7 @@ listeners: []
 rules:
   - MATCH,DIRECT
 YAML
+        chmod 600 "$mihomo_config_path"
     fi
 }
 
@@ -354,12 +548,13 @@ append_ss_config() {
     init_mihomo_config
 
     # 2. 备份
-    cp "$mihomo_config_path" "${mihomo_config_path}.bak.$(date +%s)"
+    local config_backup
+    config_backup=$(backup_config "bak") || return 1
 
     # 3. 构建 listener YAML 块并追加
     # 使用 Python 来安全操作 YAML（避免纯 sed 的危险）
-    python3 -c "
-import sys, os
+    if ! python3 -c "
+import json, os, re, stat, sys, tempfile
 
 config_path = sys.argv[1]
 port = int(sys.argv[2])
@@ -371,25 +566,25 @@ tag = sys.argv[5]
 with open(config_path, 'r') as f:
     content = f.read()
 
-# 构造新的 listener 块
-listener_block = '''
-  - name: {tag}
+# JSON 字符串也是合法的 YAML 标量，可避免密码中的引号、# 等字符破坏配置。
+quote = lambda value: json.dumps(value, ensure_ascii=False)
+listener_block = f'''
+  - name: {quote(tag)}
     type: shadowsocks
     port: {port}
     listen: 0.0.0.0
-    cipher: {method}
-    password: \"{password}\"
-    udp: true'''.format(tag=tag, port=port, method=method, password=password)
+    cipher: {quote(method)}
+    password: {quote(password)}
+    udp: true'''
 
 # 检查 listeners 是否存在且为空列表
-import re
 # 如果有 'listeners: []'，替换为带内容的版本
-if re.search(r'^listeners:\s*\[\]\s*$', content, re.MULTILINE):
-    content = re.sub(r'^listeners:\s*\[\]\s*$', 'listeners:' + listener_block, content, flags=re.MULTILINE)
-elif re.search(r'^listeners:\s*$', content, re.MULTILINE):
+if re.search(r'^listeners:\s*\[\]\s*(?:#.*)?$', content, re.MULTILINE):
+    content = re.sub(r'^listeners:\s*\[\]\s*(?:#.*)?$', 'listeners:' + listener_block, content, count=1, flags=re.MULTILINE)
+elif re.search(r'^listeners:\s*(?:#.*)?$', content, re.MULTILINE):
     # listeners: 后面没有内容
-    content = re.sub(r'^listeners:\s*$', 'listeners:' + listener_block, content, flags=re.MULTILINE)
-elif 'listeners:' in content:
+    content = re.sub(r'^listeners:\s*(?:#.*)?$', 'listeners:' + listener_block, content, count=1, flags=re.MULTILINE)
+elif re.search(r'^listeners:', content, re.MULTILINE):
     # listeners 已有内容，追加到末尾
     # 找到 listeners: 部分，在其最后一个 listener 条目后追加
     lines = content.split('\n')
@@ -398,7 +593,7 @@ elif 'listeners:' in content:
     inserted = False
     for i, line in enumerate(lines):
         result_lines.append(line)
-        if line.startswith('listeners:'):
+        if re.match(r'^listeners:', line):
             in_listeners = True
             continue
         if in_listeners and not inserted:
@@ -416,11 +611,28 @@ else:
     # 没有 listeners 段，添加它
     content += '\nlisteners:' + listener_block + '\n'
 
-with open(config_path, 'w') as f:
-    f.write(content)
-" "$mihomo_config_path" "$port" "$method" "$password" "$tag"
+directory = os.path.dirname(config_path) or '.'
+fd, tmp = tempfile.mkstemp(prefix='.config.', dir=directory, text=True)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(content)
+    os.chmod(tmp, stat.S_IMODE(os.stat(config_path).st_mode))
+    os.replace(tmp, config_path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+" "$mihomo_config_path" "$port" "$method" "$password" "$tag"; then
+        cp "$config_backup" "$mihomo_config_path"
+        error "写入配置失败，已恢复原配置。"
+        return 1
+    fi
     
-    chmod 644 "$mihomo_config_path"
+    chmod 600 "$mihomo_config_path"
+    if ! validate_mihomo_config; then
+        cp "$config_backup" "$mihomo_config_path"
+        error "新配置未通过 Mihomo 检查，已恢复原配置。"
+        return 1
+    fi
     success "配置已安全追加到: $mihomo_config_path"
 }
 
@@ -451,8 +663,14 @@ set_connection_address() {
         rm -f "$address_file"
         success "已恢复为自动获取公网 IP 模式。"
     else
-        echo "$new_addr" > "$address_file"
-        success "连接地址已更新为: $new_addr"
+        local normalized_addr
+        if ! normalized_addr=$(normalize_connection_address "$new_addr"); then
+            error "连接地址无效，请输入纯 IP 地址或域名（不要包含协议和端口）。"
+            return 1
+        fi
+        printf '%s\n' "$normalized_addr" > "$address_file"
+        chmod 600 "$address_file"
+        success "连接地址已更新为: $normalized_addr"
     fi
 }
 
@@ -463,26 +681,7 @@ delete_ss_node() {
     # 1. 扫描所有 SS 端口
     echo "当前已安装的 Shadowsocks 节点:"
     local ports
-    ports=$(grep -B1 'type: shadowsocks' "$mihomo_config_path" 2>/dev/null | grep 'name: ss-in-' | sed 's/.*ss-in-//' | tr -d ' ' || true)
-
-    if [[ -z "$ports" ]]; then
-        # 尝试通过 port 行获取
-        ports=$(python3 -c "
-import re
-with open('$mihomo_config_path','r') as f:
-    content = f.read()
-# 解析 listeners
-in_ss = False
-for line in content.split('\n'):
-    s = line.strip()
-    if s.startswith('- name: ss-in-'):
-        in_ss = True
-    elif s.startswith('- name:') and 'ss-in-' not in s:
-        in_ss = False
-    elif in_ss and s.startswith('port:'):
-        print(s.split(':')[1].strip())
-" 2>/dev/null || true)
-    fi
+    ports=$(managed_listener_ports "ss-in-" || true)
 
     if [[ -z "$ports" ]]; then
         error "未找到任何 Shadowsocks 节点，无需删除。"
@@ -511,29 +710,10 @@ for line in content.split('\n'):
     info "正在删除节点..."
 
     # 备份
-    cp "$mihomo_config_path" "${mihomo_config_path}.bak.del.$(date +%s)"
+    local delete_backup
+    delete_backup=$(backup_config "bak.del") || { error "备份配置失败"; return 1; }
 
-    # 删除配置 (使用 Python 精准删除)
-    python3 -c "
-import sys
-config_path = sys.argv[1]
-target_name = 'ss-in-' + sys.argv[2]
-with open(config_path, 'r') as f:
-    lines = f.readlines()
-result = []
-skip = False
-for line in lines:
-    stripped = line.strip()
-    if stripped == '- name: ' + target_name:
-        skip = True; continue
-    if skip:
-        if stripped.startswith('- name:') or (stripped and not line.startswith(' ') and not line.startswith('-') and ':' in stripped and not stripped.startswith('#')):
-            skip = False; result.append(line)
-        else: continue
-    else: result.append(line)
-with open(config_path, 'w') as f:
-    f.writelines(result)
-" "$mihomo_config_path" "$target_p"
+    remove_managed_listener "ss-in-" "$target_p" || { error "删除节点配置失败，已保留备份。"; return 1; }
 
     # 删除本地连接文件
     local link_file="/root/mihomo_ss_link_${target_p}.txt"
@@ -543,7 +723,12 @@ with open(config_path, 'w') as f:
     fi
 
     # 重启服务
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart mihomo; else rc-service mihomo restart; fi
+    if ! validate_mihomo_config || ! service_restart; then
+        cp "$delete_backup" "$mihomo_config_path"
+        service_restart >/dev/null 2>&1 || true
+        error "删除后配置未能正常加载，已恢复原配置。"
+        return 1
+    fi
     success "Shadowsocks 节点 (端口 $target_p) 已删除。"
 }
 
@@ -564,14 +749,14 @@ install_ss() {
 
     # 安装核心 & GeoData
     if ! install_mihomo_core; then return 1; fi
-    install_geodata
+    install_geodata || return 1
     
     # 写入配置
-    append_ss_config "$port" "$SS_METHOD" "$SS_PASSWORD"
+    append_ss_config "$port" "$SS_METHOD" "$SS_PASSWORD" || return 1
     
     # 设置并重启服务
-    setup_service
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart mihomo; else rc-service mihomo restart; fi
+    setup_service || return 1
+    service_restart || return 1
     
     success "安装配置完成！"
     view_subscription_info "$port"
@@ -583,20 +768,7 @@ view_subscription_info() {
     
     # 1. 扫描所有 SS 节点端口
     local ports
-    ports=$(python3 -c "
-import re
-with open('$mihomo_config_path','r') as f:
-    content = f.read()
-in_ss = False
-for line in content.split('\n'):
-    s = line.strip()
-    if s.startswith('- name: ss-in-'):
-        in_ss = True
-    elif s.startswith('- name:') and 'ss-in-' not in s:
-        in_ss = False
-    elif in_ss and s.startswith('port:'):
-        print(s.split(':')[1].strip())
-" 2>/dev/null || true)
+    ports=$(managed_listener_ports "ss-in-" || true)
     
     if [[ -z "$ports" ]]; then error "未找到 Shadowsocks 节点配置。"; return; fi
 
@@ -627,7 +799,7 @@ for line in content.split('\n'):
     # 3. 读取详细信息 (使用 Python 解析 YAML)
     local node_info
     node_info=$(python3 -c "
-import sys
+import json, re, sys
 config_path = sys.argv[1]
 target_port = int(sys.argv[2])
 
@@ -637,12 +809,29 @@ with open(config_path, 'r') as f:
 in_target = False
 name = method = password = ''
 port = 0
+
+def scalar(value):
+    value = value.strip()
+    try:
+        return str(json.loads(value))
+    except Exception:
+        return value.strip('\"').strip(\"'\")
+
+in_listeners = False
+current_name = ''
 for line in content.split('\n'):
     s = line.strip()
-    if s.startswith('- name: ss-in-'):
-        current_name = s.split(':', 1)[1].strip()
+    if re.match(r'^[^\s#][^:]*:', line):
+        in_listeners = line.split(':', 1)[0].strip() == 'listeners'
         in_target = False
-    elif in_target == False and s.startswith('port:'):
+        current_name = ''
+        continue
+    if not in_listeners:
+        continue
+    if s.startswith('- name:'):
+        current_name = scalar(s.split(':', 1)[1])
+        in_target = False
+    elif current_name.startswith('ss-in-') and not in_target and s.startswith('port:'):
         p = int(s.split(':')[1].strip())
         if p == target_port:
             in_target = True
@@ -650,21 +839,22 @@ for line in content.split('\n'):
             port = p
     elif in_target:
         if s.startswith('cipher:'):
-            method = s.split(':', 1)[1].strip()
+            method = scalar(s.split(':', 1)[1])
         elif s.startswith('password:'):
-            password = s.split(':', 1)[1].strip().strip('\"').strip(\"'\")
+            password = scalar(s.split(':', 1)[1])
         elif s.startswith('- name:'):
             break
 
 if name:
-    print(f'{name}|{port}|{method}|{password}')
+    print(json.dumps({'name': name, 'port': port, 'method': method, 'password': password}, ensure_ascii=False))
 " "$mihomo_config_path" "$target_port" 2>/dev/null || true)
 
     if [[ -z "$node_info" ]]; then error "读取配置失败"; return; fi
 
-    local tag=$(echo "$node_info" | cut -d'|' -f1)
-    local method=$(echo "$node_info" | cut -d'|' -f3)
-    local password=$(echo "$node_info" | cut -d'|' -f4)
+    local tag method password
+    tag=$(printf '%s' "$node_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+    method=$(printf '%s' "$node_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["method"])')
+    password=$(printf '%s' "$node_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
     
     # 4. 确定连接地址 (NAT/DDNS 支持)
     local ip
@@ -677,7 +867,8 @@ if name:
     
     # 5. 生成链接 (SIP002)
     local user_info="${method}:${password}"
-    local user_info_b64=$(echo -n "$user_info" | base64 -w 0)
+    local user_info_b64
+    user_info_b64=$(python3 -c 'import base64,sys; print(base64.urlsafe_b64encode(sys.argv[1].encode()).decode().rstrip("="))' "$user_info")
 
     local ipinfo_json country org link_name
     ipinfo_json=$(curl -sf --max-time 5 https://ipinfo.io 2>/dev/null)
@@ -690,8 +881,10 @@ if name:
     else
         link_name="$tag"
     fi
-    local link_name_encoded=$(echo "$link_name" | sed 's/ /%20/g')
-    local link="ss://${user_info_b64}@${ip}:${target_port}#${link_name_encoded}"
+    local link_name_encoded display_ip
+    link_name_encoded=$(url_encode "$link_name")
+    display_ip=$(format_uri_host "$ip")
+    local link="ss://${user_info_b64}@${display_ip}:${target_port}#${link_name_encoded}"
 
     # 6. 独立文件保存
     local save_file="/root/mihomo_ss_link_${target_port}.txt"
@@ -711,44 +904,56 @@ if name:
         echo -e "${cyan}${link}${none}"
         echo "----------------------------------------------------------------"
         echo "$link" > "$save_file"
+        chmod 600 "$save_file"
     fi
 }
 
 update_mihomo() {
     info "检查更新..."
-    install_mihomo_core
-    install_geodata
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart mihomo; else rc-service mihomo restart; fi
+    install_mihomo_core || return 1
+    install_geodata || return 1
+    service_restart || return 1
     success "Mihomo 已更新"
 }
 
 restart_mihomo() {
     info "正在重启 Mihomo..."
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart mihomo; else rc-service mihomo restart; fi
+    service_restart || return 1
     success "服务已重启"
 }
 
 uninstall_mihomo() {
     read -p "确定卸载 Mihomo 吗？(删除程序文件，保留配置文件可选) [y/N]: " confirm
     if [[ ! $confirm =~ ^[yY]$ ]]; then return; fi
+
+    local del_conf config_archive=""
+    read -p "是否删除配置文件和日志？删除前会自动备份。[y/N]: " del_conf
+    if [[ $del_conf =~ ^[yY]$ ]]; then
+        if ! config_archive=$(backup_config_archive); then
+            error "配置备份失败，已取消卸载，未删除任何文件。"
+            return 1
+        fi
+    fi
     
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
         systemctl stop mihomo || true
         systemctl disable mihomo || true
         rm -f /etc/systemd/system/mihomo.service
-        systemctl daemon-reload
-    else
+        systemctl daemon-reload || true
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
         rc-service mihomo stop || true
         rc-update del mihomo default || true
         rm -f /etc/init.d/mihomo
+    else
+        error "无法确定服务管理器，已取消卸载。"
+        return 1
     fi
     
     rm -f "$mihomo_binary_path"
-    read -p "是否删除配置文件和日志？[y/N]: " del_conf
     if [[ $del_conf =~ ^[yY]$ ]]; then
         rm -rf "$mihomo_config_dir" /var/log/mihomo
         rm -f /root/inbound_address.txt # 同时清理地址配置文件
-        success "Mihomo 及配置已完全卸载"
+        success "Mihomo 及配置已完全卸载；配置备份: $config_archive"
     else
         success "Mihomo 程序已卸载，配置保留"
     fi
@@ -777,20 +982,7 @@ modify_config() {
     # 1. 扫描所有 SS 端口
     echo "当前 Shadowsocks 节点:"
     local ports
-    ports=$(python3 -c "
-import re
-with open('$mihomo_config_path','r') as f:
-    content = f.read()
-in_ss = False
-for line in content.split('\n'):
-    s = line.strip()
-    if s.startswith('- name: ss-in-'):
-        in_ss = True
-    elif s.startswith('- name:') and 'ss-in-' not in s:
-        in_ss = False
-    elif in_ss and s.startswith('port:'):
-        print(s.split(':')[1].strip())
-" 2>/dev/null || true)
+    ports=$(managed_listener_ports "ss-in-" || true)
     
     if [[ -z "$ports" ]]; then error "未找到 SS 节点"; return; fi
     
@@ -808,32 +1000,18 @@ for line in content.split('\n'):
     
     select_method_and_password
     
-    # 删除旧配置
-    python3 -c "
-import sys
-config_path = sys.argv[1]
-target_name = 'ss-in-' + sys.argv[2]
-with open(config_path, 'r') as f:
-    lines = f.readlines()
-result = []
-skip = False
-for line in lines:
-    stripped = line.strip()
-    if stripped == '- name: ' + target_name:
-        skip = True; continue
-    if skip:
-        if stripped.startswith('- name:') or (stripped and not line.startswith(' ') and not line.startswith('-') and ':' in stripped and not stripped.startswith('#')):
-            skip = False; result.append(line)
-        else: continue
-    else: result.append(line)
-with open(config_path, 'w') as f:
-    f.writelines(result)
-" "$mihomo_config_path" "$target_p"
+    # 先备份原始配置，再删除旧入站；避免 append 阶段的备份已经丢失旧节点。
+    local modify_backup
+    modify_backup=$(backup_config "bak.modify") || { error "备份配置失败"; return 1; }
+    remove_managed_listener "ss-in-" "$target_p" || { error "删除旧节点失败"; return 1; }
     
     # 追加新配置
-    append_ss_config "$target_p" "$SS_METHOD" "$SS_PASSWORD"
-    
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart mihomo; else rc-service mihomo restart; fi
+    if ! append_ss_config "$target_p" "$SS_METHOD" "$SS_PASSWORD" || ! service_restart; then
+        cp "$modify_backup" "$mihomo_config_path"
+        service_restart >/dev/null 2>&1 || true
+        error "修改失败，已恢复原配置。"
+        return 1
+    fi
     success "修改完成"
     view_subscription_info "$target_p"
 }

@@ -4,16 +4,36 @@
 set -uo pipefail  # 去掉 -e，避免提前退出
 
 PURGE=false
-[[ "${1:-}" == "--purge" ]] && PURGE=true
+ASSUME_YES=false
+CONFIG_REMOVED=false
+CONFIG_BACKUP=""
 
 die()  { echo -e "\e[31m[ERROR]\e[0m $*" >&2; exit 1; }
 info() { echo -e "\e[32m[INFO]\e[0m $*"; }
 warn() { echo -e "\e[33m[WARN]\e[0m $*"; }
 
+for arg in "$@"; do
+  case "$arg" in
+    --purge) PURGE=true ;;
+    --yes|-y) ASSUME_YES=true ;;
+    *) die "未知参数: $arg（支持 --yes 和 --purge）" ;;
+  esac
+done
+
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     die "请以 root 身份运行（使用 sudo）"
   fi
+}
+
+confirm_uninstall() {
+  $ASSUME_YES && return 0
+  if [[ ! -t 0 ]]; then
+    die "非交互环境必须显式传入 --yes 才会执行卸载。"
+  fi
+  local answer
+  read -r -p "确定卸载 Mihomo 并删除其程序与配置吗？[y/N]: " answer
+  [[ "$answer" =~ ^[yY]$ ]] || { info "已取消卸载。"; exit 0; }
 }
 
 detect_os() {
@@ -31,7 +51,7 @@ detect_os() {
   info "系统：${PRETTY_NAME:-$OS_ID}"
 }
 
-has_systemd() { command -v systemctl >/dev/null 2>&1; }
+has_systemd() { command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
 
 collect_mihomo_units() {
   if ! has_systemd; then
@@ -108,11 +128,21 @@ backup_and_remove_config() {
   if [[ -d "$cfg_dir" ]]; then
     local ts backup
     ts="$(date +%Y%m%d-%H%M%S)"
-    backup="/root/mihomo-config-backup-${ts}.tar.gz"
+    backup="/root/mihomo-config-backup-${ts}-$$.tar.gz"
     info "备份配置目录到 $backup"
-    tar -czf "$backup" -C "$(dirname "$cfg_dir")" "$(basename "$cfg_dir")" || true
+    if ! tar -czf "$backup" -C "$(dirname "$cfg_dir")" "$(basename "$cfg_dir")"; then
+      warn "配置备份失败，出于安全考虑不会删除 $cfg_dir"
+      rm -f "$backup" 2>/dev/null || true
+      return 1
+    fi
+    chmod 600 "$backup" || { warn "无法收紧备份文件权限，配置目录不会删除。"; return 1; }
     info "删除配置目录 $cfg_dir"
-    rm -rf "$cfg_dir" || true
+    if ! rm -rf "$cfg_dir"; then
+      warn "配置目录删除失败：$cfg_dir"
+      return 1
+    fi
+    CONFIG_REMOVED=true
+    CONFIG_BACKUP="$backup"
     echo -e "\e[34m[NOTE]\e[0m 备份已保存：$backup"
   else
     warn "未找到配置目录：$cfg_dir"
@@ -162,7 +192,14 @@ remove_user_group_if_purge() {
 summary() {
   echo
   echo "====== 卸载完成 ======"
-  echo "已停止并移除 systemd/OpenRC 服务、删除单元文件、二进制与配置。"
+  echo "已停止并移除 systemd/OpenRC 服务，并删除 Mihomo 二进制。"
+  if $CONFIG_REMOVED; then
+    echo "配置已删除，备份保存在：$CONFIG_BACKUP"
+  elif [[ -d /usr/local/etc/mihomo ]]; then
+    echo "配置仍保留在 /usr/local/etc/mihomo（备份或删除未成功）。"
+  else
+    echo "未发现 Mihomo 配置目录。"
+  fi
   if $PURGE; then
     echo "已尝试删除 mihomo 用户与组。"
   else
@@ -178,13 +215,14 @@ summary() {
 
 main() {
   require_root
+  confirm_uninstall
   detect_os
 
   stop_disable_systemd_units
   remove_systemd_files
   stop_disable_openrc
   remove_openrc_files
-  backup_and_remove_config
+  backup_and_remove_config || true
   remove_binary_and_misc
   remove_user_group_if_purge
   has_systemd && systemctl daemon-reload || true

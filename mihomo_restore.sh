@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # --- 全局设置 ---
-set -u
+set -uo pipefail
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -29,6 +29,56 @@ die() { echo -e "${RED}[ERROR] $*${PLAIN}" >&2; exit 1; }
 info() { echo -e "${GREEN}[INFO] $*${PLAIN}"; }
 warn() { echo -e "${YELLOW}[WARN] $*${PLAIN}"; }
 
+validate_config_file() {
+    local candidate="$1"
+    if [[ ! -s "$candidate" ]]; then
+        warn "配置文件为空。"
+        return 1
+    fi
+    if ! grep -qE "^(mode:|listeners:|rules:|proxies:|log-level:)" "$candidate"; then
+        warn "文件不具备常见的 Mihomo 顶级配置项。"
+        return 1
+    fi
+    if [[ -x "$MIHOMO_BIN" ]]; then
+        if ! "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$candidate"; then
+            warn "Mihomo 配置测试失败，拒绝覆盖正式配置。"
+            return 1
+        fi
+    else
+        warn "Mihomo 核心不存在，只完成了基础格式检查。"
+    fi
+}
+
+install_config_file() {
+    local candidate="$1"
+    local backup_file=""
+    local staged_file
+    if [[ -f "$CONFIG_FILE" ]]; then
+        backup_file=$(mktemp "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S).XXXXXX") || return 1
+        cp "$CONFIG_FILE" "$backup_file" || { rm -f "$backup_file"; return 1; }
+        chmod 600 "$backup_file"
+        info "检测到旧配置，已自动备份为: $backup_file"
+    fi
+    staged_file=$(mktemp "${CONFIG_DIR}/.config.restore.XXXXXX") || return 1
+    if ! install -m 0600 "$candidate" "$staged_file" || ! mv -f "$staged_file" "$CONFIG_FILE"; then
+        rm -f "$staged_file"
+        return 1
+    fi
+}
+
+download_script() {
+    local url="$1" target="$2" tmp_file
+    tmp_file="$(mktemp "${target}.tmp.XXXXXX")" || return 1
+    if ! curl -fsSL -o "$tmp_file" "$url" || ! bash -n "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    if ! chmod 0755 "$tmp_file" || ! mv -f "$tmp_file" "$target"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+}
+
 # --- 权限与依赖检测 ---
 pre_check() {
     [[ ${EUID:-$(id -u)} -ne 0 ]] && die "请以 root 身份运行此脚本。"
@@ -37,7 +87,7 @@ pre_check() {
         mkdir -p "$CONFIG_DIR"
     fi
 
-    local deps=("curl" "nano")
+    local deps=("curl" "nano" "bash" "install" "mktemp" "realpath")
     local missing_deps=()
 
     for dep in "${deps[@]}"; do
@@ -49,13 +99,15 @@ pre_check() {
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         info "正在安装缺失依赖: ${missing_deps[*]} ..."
         if [[ -f /etc/alpine-release ]]; then
-            apk update && apk add --no-cache "${missing_deps[@]}"
-        elif [[ -f /etc/os-release ]]; then
-            apt-get update && apt-get install -y "${missing_deps[@]}"
+            apk update && apk add --no-cache curl nano bash coreutils
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update && apt-get install -y curl nano bash coreutils
         else
             die "无法检测系统包管理器，请手动安装: ${missing_deps[*]}"
         fi
     fi
+    local dep
+    for dep in "${deps[@]}"; do command -v "$dep" >/dev/null 2>&1 || die "缺少必要命令: $dep"; done
 }
 
 # --- 自我安装 ---
@@ -89,24 +141,15 @@ restore_from_url() {
     tmp_file="$(mktemp)"
     
     if curl -fsSL -o "$tmp_file" "$url"; then
-        # 简单检查是否是 YAML
-        if grep -qE "^(mode:|listeners:|rules:|proxies:|log-level:)" "$tmp_file"; then
-            
-            if [[ -f "$CONFIG_FILE" ]]; then
-                local backup_file="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-                cp "$CONFIG_FILE" "$backup_file"
-                info "检测到旧配置，已自动备份为: $backup_file"
-            fi
-
-            mv "$tmp_file" "$CONFIG_FILE"
-            chmod 644 "$CONFIG_FILE"
+        if validate_config_file "$tmp_file" && install_config_file "$tmp_file"; then
+            rm -f "$tmp_file"
             info "新配置文件已成功下载并保存到: $CONFIG_FILE"
-            info "建议使用选项 3 测试配置文件有效性。"
         else
-            warn "下载的文件似乎不是有效的 Mihomo YAML 配置，已取消覆盖。"
+            warn "新配置校验或安装失败，原配置未被覆盖。"
             rm -f "$tmp_file"
         fi
     else
+        rm -f "$tmp_file"
         die "下载失败，请检查 URL 或网络连接。"
     fi
     
@@ -117,27 +160,25 @@ restore_from_url() {
 # --- 功能 2: 手动粘贴 ---
 restore_manual() {
     echo "================ 手动粘贴配置 ================"
-    
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local backup_file="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-        cp "$CONFIG_FILE" "$backup_file"
-        info "检测到旧配置，已自动备份为: $backup_file"
-    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)" || { warn "无法创建临时文件。"; return; }
+    if [[ -f "$CONFIG_FILE" ]]; then cp "$CONFIG_FILE" "$tmp_file"; fi
 
     info "即将打开 nano 编辑器..."
-    info "请将您的 config.yaml 内容粘贴进去 (这会覆盖当前 config.yaml)。"
+    info "请将您的 config.yaml 内容粘贴进去；保存后会先校验，再决定是否覆盖。"
     info "操作提示: 粘贴后按 Ctrl+O 保存 (回车确认)，然后 Ctrl+X 退出。"
     echo
     read -n 1 -s -r -p "按任意键开始编辑..." || true
     
-    nano "$CONFIG_FILE"
+    nano "$tmp_file"
     
-    if [[ -s "$CONFIG_FILE" ]]; then
-        info "编辑完成，文件已保存。"
-        info "建议使用选项 3 测试配置文件有效性。"
+    if validate_config_file "$tmp_file" && install_config_file "$tmp_file"; then
+        info "编辑后的配置已通过检查并保存。"
     else
-        warn "文件为空或未保存。"
+        warn "编辑内容为空、无效或安装失败，原配置未被覆盖。"
     fi
+    rm -f "$tmp_file"
     
     echo
     read -n 1 -s -r -p "按任意键返回主菜单..." || true
@@ -158,8 +199,8 @@ test_config() {
     info "正在执行: mihomo -t -d $CONFIG_DIR"
     echo "------------------------------------------------"
     
-    "$MIHOMO_BIN" -t -d "$CONFIG_DIR"
-    local ret=$?
+    local ret=0
+    "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || ret=$?
     
     echo "------------------------------------------------"
     if [[ $ret -eq 0 ]]; then
@@ -178,8 +219,7 @@ test_config() {
 update_script() {
     info "正在检查更新..."
     
-    if curl -fsSL -o "$SCRIPT_PATH" "$UPDATE_URL"; then
-        chmod +x "$SCRIPT_PATH"
+    if download_script "$UPDATE_URL" "$SCRIPT_PATH"; then
         info "脚本更新成功！正在重新加载..."
         sleep 1
         exec "$SCRIPT_PATH"

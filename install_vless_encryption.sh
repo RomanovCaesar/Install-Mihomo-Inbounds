@@ -35,8 +35,8 @@ INIT_SYSTEM=""
 
 # --- 辅助函数 ---
 error() { echo -e "\n${red}[✖] $1${none}\n" >&2; }
-info()  { [[ "$is_quiet" = false ]] && echo -e "\n${yellow}[!] $1${none}\n"; }
-success(){ [[ "$is_quiet" = false ]] && echo -e "\n${green}[✔] $1${none}\n"; }
+info()  { if [[ "$is_quiet" = false ]]; then echo -e "\n${yellow}[!] $1${none}\n"; fi; return 0; }
+success(){ if [[ "$is_quiet" = false ]]; then echo -e "\n${green}[✔] $1${none}\n"; fi; return 0; }
 
 spinner() {
     local pid=$1; local spinstr='|/-\\'
@@ -62,6 +62,29 @@ get_public_ip() {
     error "无法获取公网 IP 地址。" && return 1
 }
 
+normalize_connection_address() {
+    python3 - "$1" <<'PY'
+import ipaddress, re, sys
+value = sys.argv[1].strip()
+if value.startswith('[') and value.endswith(']'):
+    value = value[1:-1]
+try:
+    print(ipaddress.ip_address(value).compressed)
+except ValueError:
+    if len(value) > 253 or not re.fullmatch(r'(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', value):
+        raise SystemExit(1)
+    print(value.rstrip('.'))
+PY
+}
+
+format_uri_host() {
+    if [[ "$1" == *:* ]]; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
+}
+
+url_encode() {
+    python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
 # --- 核心安装逻辑 ---
 install_mihomo_core() {
     info "开始安装 Mihomo 核心..."
@@ -81,7 +104,7 @@ install_mihomo_core() {
     local version_str="${tag:-latest}"
     info "目标版本: $version_str"
 
-    local tmpdir; tmpdir="$(mktemp -d)"
+    local tmpdir; tmpdir="$(mktemp -d)" || return 1
     local filename="mihomo-linux-${arch}-${tag}.gz"
     local url_tag="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/${filename}"
     local url_alt="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-${arch}.gz"
@@ -92,17 +115,35 @@ install_mihomo_core() {
     else rm -rf "$tmpdir"; error "下载 Mihomo 失败"; return 1; fi
 
     info "解压并安装到 /usr/local/bin ..."
-    gzip -d "$tmpdir/mihomo.gz"
-    install -m 0755 "$tmpdir/mihomo" "$mihomo_binary_path"
-    mkdir -p "$mihomo_config_dir"
+    if ! gzip -d "$tmpdir/mihomo.gz" || ! chmod +x "$tmpdir/mihomo" || ! "$tmpdir/mihomo" -v >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        error "下载的 Mihomo 核心无法执行，已取消安装。"
+        return 1
+    fi
+    install -m 0755 "$tmpdir/mihomo" "$mihomo_binary_path" || { rm -rf "$tmpdir"; return 1; }
+    mkdir -p "$mihomo_config_dir" || return 1
     rm -rf "$tmpdir"
     success "Mihomo 核心安装完成"
 }
 
 install_geodata() {
     info "正在安装/更新 GeoIP 和 GeoSite 数据文件..."
-    curl -fsSL -o "${mihomo_config_dir}/geoip.metadb" https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.metadb
-    curl -fsSL -o "${mihomo_config_dir}/geosite.dat" https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+    mkdir -p "$mihomo_config_dir" || return 1
+    local tmpdir
+    tmpdir="$(mktemp -d "${mihomo_config_dir}/.geo-install.XXXXXX")" || return 1
+    if ! curl -fsSL -o "$tmpdir/geoip.metadb" https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.metadb \
+        || ! curl -fsSL -o "$tmpdir/geosite.dat" https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat \
+        || [[ ! -s "$tmpdir/geoip.metadb" || ! -s "$tmpdir/geosite.dat" ]]; then
+        rm -rf "$tmpdir"
+        error "Geo 数据文件下载失败，原文件未被覆盖。"
+        return 1
+    fi
+    chmod 0644 "$tmpdir/geoip.metadb" "$tmpdir/geosite.dat"
+    if ! mv -f "$tmpdir/geoip.metadb" "${mihomo_config_dir}/geoip.metadb" \
+        || ! mv -f "$tmpdir/geosite.dat" "${mihomo_config_dir}/geosite.dat"; then
+        rm -rf "$tmpdir"; error "Geo 数据文件安装失败。"; return 1
+    fi
+    rm -rf "$tmpdir"
     success "Geo 数据文件已更新"
 }
 
@@ -128,8 +169,9 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now mihomo
+    [[ -s /etc/systemd/system/mihomo.service ]] || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable --now mihomo || return 1
     success "Systemd 服务已安装并启动"
 }
 
@@ -151,16 +193,25 @@ depend() {
   use dns
 }
 EOF
-    chmod +x /etc/init.d/mihomo
-    rc-update add mihomo default
-    rc-service mihomo restart || rc-service mihomo start
+    [[ -s /etc/init.d/mihomo ]] || return 1
+    chmod +x /etc/init.d/mihomo || return 1
+    rc-update add mihomo default || return 1
+    rc-service mihomo restart || rc-service mihomo start || return 1
     success "OpenRC 服务已安装并启动"
 }
 
 setup_service() {
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then install_service_systemd
     elif [[ "$INIT_SYSTEM" == "openrc" ]]; then install_service_openrc
-    else error "无法确定服务管理器，请手动配置自启动。"; fi
+    else error "无法确定服务管理器，请手动配置自启动。"; return 1; fi
+}
+
+validate_mihomo_config() {
+    if [[ -x "$mihomo_binary_path" ]]; then
+        "$mihomo_binary_path" -t -d "$mihomo_config_dir"
+    else
+        return 0
+    fi
 }
 
 # --- 验证函数 ---
@@ -193,6 +244,122 @@ is_listener_port_in_config() {
     ' "$mihomo_config_path" 2>/dev/null
 }
 
+managed_listener_ports() {
+    local prefix=$1
+    [[ -f "$mihomo_config_path" ]] || return 1
+    python3 - "$mihomo_config_path" "$prefix" <<'PY'
+import json, re, sys
+path, prefix = sys.argv[1:]
+in_listeners = False
+current_name = None
+
+def scalar(value):
+    value = value.strip()
+    try:
+        return str(json.loads(value))
+    except Exception:
+        return value.strip("\"'")
+
+with open(path, encoding='utf-8') as f:
+    for raw in f:
+        if re.match(r'^[^\s#][^:]*:', raw):
+            in_listeners = raw.split(':', 1)[0].strip() == 'listeners'
+            current_name = None
+            continue
+        if not in_listeners:
+            continue
+        stripped = raw.strip()
+        if stripped.startswith('- name:'):
+            current_name = scalar(stripped.split(':', 1)[1])
+        elif current_name and current_name.startswith(prefix) and stripped.startswith('port:'):
+            value = scalar(stripped.split(':', 1)[1])
+            if value.isdigit() and current_name == prefix + value:
+                print(value)
+PY
+}
+
+backup_config() {
+    local suffix="${1:-bak}"
+    local backup
+    backup=$(mktemp "${mihomo_config_path}.${suffix}.$(date +%Y%m%d%H%M%S).XXXXXX") || return 1
+    cp "$mihomo_config_path" "$backup" || { rm -f "$backup"; return 1; }
+    chmod 600 "$backup"
+    printf '%s\n' "$backup"
+}
+
++backup_config_archive() {
+    [[ -d "$mihomo_config_dir" ]] || return 0
+    local archive
+    archive=$(mktemp "/root/mihomo-config-backup-$(date +%Y%m%d%H%M%S).XXXXXX.tar.gz") || return 1
+    if ! tar -czf "$archive" -C "$(dirname "$mihomo_config_dir")" "$(basename "$mihomo_config_dir")"; then
+        rm -f "$archive"
+        return 1
+    fi
+    chmod 600 "$archive" || return 1
+    printf '%s\n' "$archive"
+}
+
+remove_managed_listener() {
+    local prefix=$1 port=$2
+    python3 - "$mihomo_config_path" "$prefix" "$port" <<'PY'
+import json, os, re, stat, sys, tempfile
+path, prefix, port = sys.argv[1:]
+target_name = prefix + port
+in_listeners = False
+skip = False
+skip_indent = -1
+removed = False
+result = []
+
+def scalar(value):
+    value = value.strip()
+    try:
+        return str(json.loads(value))
+    except Exception:
+        return value.strip("\"'")
+
+with open(path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+for raw in lines:
+    if re.match(r'^[^\s#][^:]*:', raw):
+        skip = False
+        in_listeners = raw.split(':', 1)[0].strip() == 'listeners'
+        result.append(raw)
+        continue
+
+    stripped = raw.strip()
+    indent = len(raw) - len(raw.lstrip())
+    if in_listeners and stripped.startswith('- name:'):
+        if skip and indent <= skip_indent:
+            skip = False
+        name = scalar(stripped.split(':', 1)[1])
+        if not skip and name == target_name:
+            skip = True
+            skip_indent = indent
+            removed = True
+            continue
+
+    if skip:
+        continue
+    result.append(raw)
+
+if not removed:
+    raise SystemExit(2)
+
+directory = os.path.dirname(path) or '.'
+fd, tmp = tempfile.mkstemp(prefix='.config.', dir=directory, text=True)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.writelines(result)
+    os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
 is_port_in_use() {
     local port=$1
     if command -v ss &>/dev/null; then ss -tuln 2>/dev/null | grep -q ":$port " && return 0
@@ -208,15 +375,17 @@ is_valid_uuid() { local uuid=$1; [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0
 # --- 系统检测 ---
 detect_system() {
     if [[ -f /etc/os-release ]]; then . /etc/os-release; OS_ID=${ID:-}; fi
-    if command -v systemctl >/dev/null 2>&1; then INIT_SYSTEM="systemd"
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then INIT_SYSTEM="systemd"
     elif command -v rc-service >/dev/null 2>&1; then INIT_SYSTEM="openrc"
     else INIT_SYSTEM="unknown"; fi
 }
 
 service_restart() {
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart mihomo
-    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then rc-service mihomo restart
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart mihomo || return 1
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then rc-service mihomo restart || return 1
     else error "无法确定服务管理器，请手动重启。"; return 1; fi
+    sleep 1
+    service_is_active
 }
 
 service_is_active() {
@@ -228,21 +397,25 @@ service_is_active() {
 check_system_compatibility() {
     if [[ "$(uname -s)" != "Linux" ]]; then error "仅支持 Linux"; return 1; fi
     detect_system
-    local required_commands=("awk" "grep" "sed" "unzip")
+    local required_commands=("awk" "grep" "sed" "curl" "python3" "openssl" "unzip" "gzip" "base64" "install" "mktemp" "tar")
     local missing_commands=()
     for cmd in "${required_commands[@]}"; do command -v "$cmd" >/dev/null 2>&1 || missing_commands+=("$cmd"); done
     if [[ ${#missing_commands[@]} -gt 0 ]]; then
         info "正在安装缺失依赖: ${missing_commands[*]} ..."
-        if [[ "$OS_ID" == "alpine" ]]; then apk add --no-cache "${missing_commands[@]}" bash curl python3 coreutils
-        elif command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl python3 "${missing_commands[@]}"
+        if [[ "$OS_ID" == "alpine" ]]; then apk add --no-cache bash curl python3 openssl unzip gzip coreutils
+        elif command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash curl python3 openssl unzip gzip coreutils
+        else error "当前系统不支持自动安装依赖"; return 1
         fi
     fi
+    for cmd in "${required_commands[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || { error "缺少必要命令: $cmd"; return 1; }
+    done
     return 0
 }
 
 pre_check() {
     [[ $(id -u) != 0 ]] && error "必须以 root 运行" && exit 1
-    check_system_compatibility
+    check_system_compatibility || exit 1
 }
 
 check_mihomo_status() {
@@ -256,7 +429,7 @@ check_mihomo_status() {
 # --- 核心 VLESS Encryption 生成逻辑 ---
 generate_vless_tokens() {
     info "正在生成 VLESS Encryption (ML-KEM-768) 密钥..."
-    local tmpdir; tmpdir="$(mktemp -d)"
+    local tmpdir; tmpdir="$(mktemp -d)" || return 1
     local machine; machine="$(uname -m)"
     local arch
     case "$machine" in
@@ -298,7 +471,7 @@ generate_vless_tokens() {
 init_mihomo_config() {
     if [[ ! -f "$mihomo_config_path" ]]; then
         info "配置文件不存在，创建新配置..."
-        mkdir -p "$mihomo_config_dir"
+        mkdir -p "$mihomo_config_dir" || return 1
         cat > "$mihomo_config_path" <<'YAML'
 mode: rule
 log-level: warning
@@ -310,6 +483,7 @@ listeners: []
 rules:
   - MATCH,DIRECT
 YAML
+        chmod 600 "$mihomo_config_path"
     fi
 }
 
@@ -319,10 +493,11 @@ append_vless_config() {
     local tag="vless-pq-in-${port}"
 
     init_mihomo_config
-    cp "$mihomo_config_path" "${mihomo_config_path}.bak.$(date +%s)"
+    local config_backup
+    config_backup=$(backup_config "bak") || return 1
 
-    python3 -c "
-import sys, re
+    if ! python3 -c "
+import json, os, re, stat, sys, tempfile
 
 config_path = sys.argv[1]
 port = int(sys.argv[2])
@@ -333,27 +508,28 @@ tag = sys.argv[5]
 with open(config_path, 'r') as f:
     content = f.read()
 
+quote = lambda value: json.dumps(value, ensure_ascii=False)
 listener_block = f'''
-  - name: {tag}
+  - name: {quote(tag)}
     type: vless
     port: {port}
     listen: 0.0.0.0
     users:
-      - uuid: {uuid}
-    decryption: \"{dec_key}\"'''
+      - uuid: {quote(uuid)}
+    decryption: {quote(dec_key)}'''
 
-if re.search(r'^listeners:\s*\[\]\s*$', content, re.MULTILINE):
-    content = re.sub(r'^listeners:\s*\[\]\s*$', 'listeners:' + listener_block, content, flags=re.MULTILINE)
-elif re.search(r'^listeners:\s*$', content, re.MULTILINE):
-    content = re.sub(r'^listeners:\s*$', 'listeners:' + listener_block, content, flags=re.MULTILINE)
-elif 'listeners:' in content:
+if re.search(r'^listeners:\s*\[\]\s*(?:#.*)?$', content, re.MULTILINE):
+    content = re.sub(r'^listeners:\s*\[\]\s*(?:#.*)?$', 'listeners:' + listener_block, content, count=1, flags=re.MULTILINE)
+elif re.search(r'^listeners:\s*(?:#.*)?$', content, re.MULTILINE):
+    content = re.sub(r'^listeners:\s*(?:#.*)?$', 'listeners:' + listener_block, content, count=1, flags=re.MULTILINE)
+elif re.search(r'^listeners:', content, re.MULTILINE):
     lines = content.split('\n')
     result_lines = []
     in_listeners = False
     inserted = False
     for i, line in enumerate(lines):
         result_lines.append(line)
-        if line.startswith('listeners:'):
+        if re.match(r'^listeners:', line):
             in_listeners = True
             continue
         if in_listeners and not inserted:
@@ -367,11 +543,28 @@ elif 'listeners:' in content:
 else:
     content += '\nlisteners:' + listener_block + '\n'
 
-with open(config_path, 'w') as f:
-    f.write(content)
-" "$mihomo_config_path" "$port" "$uuid" "$decryption_key" "$tag"
+directory = os.path.dirname(config_path) or '.'
+fd, tmp = tempfile.mkstemp(prefix='.config.', dir=directory, text=True)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(content)
+    os.chmod(tmp, stat.S_IMODE(os.stat(config_path).st_mode))
+    os.replace(tmp, config_path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+" "$mihomo_config_path" "$port" "$uuid" "$decryption_key" "$tag"; then
+        cp "$config_backup" "$mihomo_config_path"
+        error "写入配置失败，已恢复原配置。"
+        return 1
+    fi
 
-    chmod 644 "$mihomo_config_path"
+    chmod 600 "$mihomo_config_path"
+    if ! validate_mihomo_config; then
+        cp "$config_backup" "$mihomo_config_path"
+        error "新配置未通过 Mihomo 检查，已恢复原配置。"
+        return 1
+    fi
     success "配置已安全追加到: $mihomo_config_path"
 }
 
@@ -395,7 +588,14 @@ set_connection_address() {
     if [[ -z "$new_addr" ]]; then
         rm -f "$address_file"; success "已恢复为自动获取公网 IP 模式。"
     else
-        echo "$new_addr" > "$address_file"; success "连接地址已更新为: $new_addr"
+        local normalized_addr
+        if ! normalized_addr=$(normalize_connection_address "$new_addr"); then
+            error "连接地址无效，请输入纯 IP 地址或域名（不要包含协议和端口）。"
+            return 1
+        fi
+        printf '%s\n' "$normalized_addr" > "$address_file"
+        chmod 600 "$address_file"
+        success "连接地址已更新为: $normalized_addr"
     fi
 }
 
@@ -405,19 +605,7 @@ delete_vless_pq_node() {
 
     echo "当前已安装的 VLESS Encryption (Post-Quantum) 节点:"
     local ports
-    ports=$(python3 -c "
-with open('$mihomo_config_path','r') as f:
-    content = f.read()
-in_pq = False
-for line in content.split('\n'):
-    s = line.strip()
-    if s.startswith('- name: vless-pq-in-'):
-        in_pq = True
-    elif s.startswith('- name:') and 'vless-pq-in-' not in s:
-        in_pq = False
-    elif in_pq and s.startswith('port:'):
-        print(s.split(':')[1].strip())
-" 2>/dev/null || true)
+    ports=$(managed_listener_ports "vless-pq-in-" || true)
 
     if [[ -z "$ports" ]]; then error "未找到任何 VLESS Encryption 节点，无需删除。"; return; fi
     for p in $ports; do echo " - 端口: $p"; done
@@ -434,33 +622,20 @@ for line in content.split('\n'):
     if [[ ! $confirm =~ ^[yY]$ ]]; then info "操作已取消。"; return; fi
 
     info "正在删除节点..."
-    cp "$mihomo_config_path" "${mihomo_config_path}.bak.del.$(date +%s)"
+    local delete_backup
+    delete_backup=$(backup_config "bak.del") || { error "备份配置失败"; return 1; }
 
-    python3 -c "
-import sys
-config_path = sys.argv[1]
-target_name = 'vless-pq-in-' + sys.argv[2]
-with open(config_path, 'r') as f:
-    lines = f.readlines()
-result = []
-skip = False
-for line in lines:
-    stripped = line.strip()
-    if stripped == '- name: ' + target_name:
-        skip = True; continue
-    if skip:
-        if stripped.startswith('- name:') or (stripped and not line.startswith(' ') and not line.startswith('-') and ':' in stripped and not stripped.startswith('#')):
-            skip = False; result.append(line)
-        else: continue
-    else: result.append(line)
-with open(config_path, 'w') as f:
-    f.writelines(result)
-" "$mihomo_config_path" "$target_p"
+    remove_managed_listener "vless-pq-in-" "$target_p" || { error "删除节点配置失败，已保留备份。"; return 1; }
 
     local link_file="/root/mihomo_vless_encryption_link_${target_p}.txt"
     [[ -f "$link_file" ]] && rm -f "$link_file"
 
-    service_restart
+    if ! validate_mihomo_config || ! service_restart; then
+        cp "$delete_backup" "$mihomo_config_path"
+        service_restart >/dev/null 2>&1 || true
+        error "删除后配置未能正常加载，已恢复原配置。"
+        return 1
+    fi
     success "VLESS Encryption 节点 (端口 $target_p) 已删除。"
 }
 
@@ -469,19 +644,7 @@ view_subscription_info() {
     if [[ ! -f "$mihomo_config_path" ]]; then error "配置不存在"; return; fi
 
     local ports
-    ports=$(python3 -c "
-with open('$mihomo_config_path','r') as f:
-    content = f.read()
-in_pq = False
-for line in content.split('\n'):
-    s = line.strip()
-    if s.startswith('- name: vless-pq-in-'):
-        in_pq = True
-    elif s.startswith('- name:') and 'vless-pq-in-' not in s:
-        in_pq = False
-    elif in_pq and s.startswith('port:'):
-        print(s.split(':')[1].strip())
-" 2>/dev/null || true)
+    ports=$(managed_listener_ports "vless-pq-in-" || true)
 
     if [[ -z "$ports" ]]; then error "未找到 VLESS Encryption 节点配置。"; return; fi
 
@@ -505,7 +668,7 @@ for line in content.split('\n'):
     # 获取 UUID 和备注名
     local node_info
     node_info=$(python3 -c "
-import sys
+import json, re, sys
 config_path = sys.argv[1]
 target_port = int(sys.argv[2])
 with open(config_path, 'r') as f:
@@ -513,11 +676,27 @@ with open(config_path, 'r') as f:
 in_target = False
 in_target_block = False
 name = uuid = ''
+in_listeners = False
+
+def scalar(value):
+    value = value.strip()
+    try:
+        return str(json.loads(value))
+    except Exception:
+        return value.strip('\"').strip(\"'\")
+
 for line in content.split('\n'):
     s = line.strip()
-    if s.startswith('- name: vless-pq-in-'):
-        current_name = s.split(':', 1)[1].strip()
-        in_target_block = True
+    if re.match(r'^[^\s#][^:]*:', line):
+        in_listeners = line.split(':', 1)[0].strip() == 'listeners'
+        in_target_block = False
+        in_target = False
+        continue
+    if not in_listeners:
+        continue
+    if s.startswith('- name:'):
+        current_name = scalar(s.split(':', 1)[1])
+        in_target_block = current_name.startswith('vless-pq-in-')
         in_target = False
     elif in_target_block and not in_target and s.startswith('port:'):
         p = int(s.split(':')[1].strip())
@@ -528,17 +707,18 @@ for line in content.split('\n'):
             in_target_block = False
     elif in_target:
         if s.startswith('- uuid:'):
-            uuid = s.split(':', 1)[1].strip()
+            uuid = scalar(s.split(':', 1)[1])
         elif s.startswith('- name:') and s != '- name: ' + name:
             break
 if name:
-    print(f'{name}|{uuid}')
+    print(json.dumps({'name': name, 'uuid': uuid}, ensure_ascii=False))
 " "$mihomo_config_path" "$target_port" 2>/dev/null || true)
 
     if [[ -z "$node_info" ]]; then error "读取配置失败"; return; fi
 
-    local tag=$(echo "$node_info" | cut -d'|' -f1)
-    local uuid=$(echo "$node_info" | cut -d'|' -f2)
+    local tag uuid
+    tag=$(printf '%s' "$node_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+    uuid=$(printf '%s' "$node_info" | python3 -c 'import json,sys; print(json.load(sys.stdin)["uuid"])')
 
     # 读取客户端 Encryption Key
     local key_file="/root/mihomo_vless_encryption_client_key_${target_port}.txt"
@@ -555,7 +735,8 @@ if name:
     if [[ -f "$address_file" && -s "$address_file" ]]; then
         ip=$(cat "$address_file"); [[ -z "$ip" ]] && ip=$(get_public_ip)
     else ip=$(get_public_ip); fi
-    local display_ip=$ip && [[ $ip =~ ":" ]] && display_ip="[$ip]"
+    local display_ip
+    display_ip=$(format_uri_host "$ip")
 
     # 生成链接
     local ipinfo_json country org link_name
@@ -566,9 +747,11 @@ if name:
     fi
     if [[ -n "${country:-}" && -n "${org:-}" ]]; then link_name="${country} - ${org}"
     else link_name="$tag"; fi
-    local link_name_encoded=$(echo "$link_name" | sed 's/ /%20/g')
+    local link_name_encoded encoded_key
+    link_name_encoded=$(url_encode "$link_name")
+    encoded_key=$(url_encode "$enc_key")
 
-    local vless_url="vless://${uuid}@${display_ip}:${target_port}?encryption=${enc_key}&type=tcp&security=none#${link_name_encoded}"
+    local vless_url="vless://${uuid}@${display_ip}:${target_port}?encryption=${encoded_key}&type=tcp&security=none#${link_name_encoded}"
     local save_file="/root/mihomo_vless_encryption_link_${target_port}.txt"
 
     if [[ "$is_quiet" = true ]]; then echo "${vless_url}"
@@ -585,6 +768,7 @@ if name:
         echo -e "${cyan}${vless_url}${none}"
         echo "----------------------------------------------------------------"
         echo "$vless_url" > "$save_file"
+        chmod 600 "$save_file"
     fi
 }
 
@@ -611,16 +795,17 @@ install_vless_pq() {
     done
 
     if ! install_mihomo_core; then return 1; fi
-    install_geodata
+    install_geodata || return 1
     
     if ! generate_vless_tokens; then return 1; fi
 
     # 写入配置，服务端存 Decryption，客户端存 Encryption
-    append_vless_config "$port" "$uuid" "$VLESS_DECRYPTION"
-    echo "$VLESS_ENCRYPTION" > "/root/mihomo_vless_encryption_client_key_${port}.txt"
+    append_vless_config "$port" "$uuid" "$VLESS_DECRYPTION" || return 1
 
-    setup_service
+    setup_service || return 1
     if ! service_restart; then return 1; fi
+    echo "$VLESS_ENCRYPTION" > "/root/mihomo_vless_encryption_client_key_${port}.txt"
+    chmod 600 "/root/mihomo_vless_encryption_client_key_${port}.txt"
     success "Mihomo VLESS PQ 安装配置成功！"
     view_subscription_info "$port"
 }
@@ -629,8 +814,8 @@ update_mihomo() {
     if [[ ! -f "$mihomo_binary_path" ]]; then error "Mihomo 未安装" && return; fi
     info "正在检查最新版本..."
     if ! install_mihomo_core; then return 1; fi
-    install_geodata
-    service_restart
+    install_geodata || return 1
+    service_restart || return 1
     success "Mihomo 更新成功！"
 }
 
@@ -641,12 +826,17 @@ restart_mihomo() {
 
 uninstall_mihomo() {
     if [[ ! -f "$mihomo_binary_path" ]]; then error "Mihomo 未安装" && return; fi
-    read -p "确定卸载 Mihomo 吗？[Y/n]: " confirm
-    if [[ "$confirm" =~ ^[nN]$ ]]; then return; fi
+    read -p "确定卸载 Mihomo 吗？配置会先自动备份。[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[yY]$ ]]; then return; fi
+    local config_archive=""
+    if ! config_archive=$(backup_config_archive); then
+        error "配置备份失败，已取消卸载，未删除任何文件。"
+        return 1
+    fi
     
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
         systemctl stop mihomo || true; systemctl disable mihomo || true
-        rm -f /etc/systemd/system/mihomo.service; systemctl daemon-reload
+        rm -f /etc/systemd/system/mihomo.service; systemctl daemon-reload || true
     elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
         rc-service mihomo stop || true; rc-update del mihomo default || true
         rm -f /etc/init.d/mihomo
@@ -655,7 +845,7 @@ uninstall_mihomo() {
     rm -f "$mihomo_binary_path"
     rm -rf "$mihomo_config_dir"
     rm -f /root/mihomo_vless_encryption_*.txt /root/inbound_address.txt
-    success "Mihomo 已成功卸载。"
+    success "Mihomo 已成功卸载；配置备份: $config_archive"
 }
 
 view_mihomo_log() {
@@ -672,19 +862,7 @@ modify_config() {
     if [[ ! -f "$mihomo_config_path" ]]; then error "配置不存在"; return; fi
     echo "当前 VLESS Encryption 节点:"
     local ports
-    ports=$(python3 -c "
-with open('$mihomo_config_path','r') as f:
-    content = f.read()
-in_pq = False
-for line in content.split('\n'):
-    s = line.strip()
-    if s.startswith('- name: vless-pq-in-'):
-        in_pq = True
-    elif s.startswith('- name:') and 'vless-pq-in-' not in s:
-        in_pq = False
-    elif in_pq and s.startswith('port:'):
-        print(s.split(':')[1].strip())
-" 2>/dev/null || true)
+    ports=$(managed_listener_ports "vless-pq-in-" || true)
 
     if [[ -z "$ports" ]]; then error "未找到节点"; return; fi
     for p in $ports; do echo " - 端口: $p"; done
@@ -707,34 +885,21 @@ for line in content.split('\n'):
         else error "UUID 格式无效"; fi
     done
 
-    # 删除旧配置
-    python3 -c "
-import sys
-config_path = sys.argv[1]
-target_name = 'vless-pq-in-' + sys.argv[2]
-with open(config_path, 'r') as f:
-    lines = f.readlines()
-result = []
-skip = False
-for line in lines:
-    stripped = line.strip()
-    if stripped == '- name: ' + target_name:
-        skip = True; continue
-    if skip:
-        if stripped.startswith('- name:') or (stripped and not line.startswith(' ') and not line.startswith('-') and ':' in stripped and not stripped.startswith('#')):
-            skip = False; result.append(line)
-        else: continue
-    else: result.append(line)
-with open(config_path, 'w') as f:
-    f.writelines(result)
-" "$mihomo_config_path" "$target_p"
-
-    # 生成新密钥
+    # 先生成新密钥；失败时保持原节点不变。
     if ! generate_vless_tokens; then return 1; fi
-    echo "$VLESS_ENCRYPTION" > "/root/mihomo_vless_encryption_client_key_${target_p}.txt"
 
-    append_vless_config "$target_p" "$new_uuid" "$VLESS_DECRYPTION"
-    service_restart
+    local modify_backup
+    modify_backup=$(backup_config "bak.modify") || { error "备份配置失败"; return 1; }
+    remove_managed_listener "vless-pq-in-" "$target_p" || { error "删除旧节点失败"; return 1; }
+
+    if ! append_vless_config "$target_p" "$new_uuid" "$VLESS_DECRYPTION" || ! service_restart; then
+        cp "$modify_backup" "$mihomo_config_path"
+        service_restart >/dev/null 2>&1 || true
+        error "修改失败，已恢复原配置。"
+        return 1
+    fi
+    echo "$VLESS_ENCRYPTION" > "/root/mihomo_vless_encryption_client_key_${target_p}.txt"
+    chmod 600 "/root/mihomo_vless_encryption_client_key_${target_p}.txt"
     success "修改完成"
     view_subscription_info "$target_p"
 }

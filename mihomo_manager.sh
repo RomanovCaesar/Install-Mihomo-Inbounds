@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # --- 全局设置 ---
-set -u
+set -uo pipefail
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -38,17 +38,45 @@ check_deps() {
         info "正在安装 curl..."
         if [ -f /etc/alpine-release ]; then
             apk add --no-cache curl
-        else
+        elif command -v apt-get >/dev/null 2>&1; then
             apt-get update && apt-get install -y curl
+        else
+            die "无法自动安装 curl，请先手动安装。"
         fi
     fi
     if ! command -v python3 >/dev/null 2>&1; then
         info "正在安装 python3..."
         if [ -f /etc/alpine-release ]; then
             apk add --no-cache python3
-        else
+        elif command -v apt-get >/dev/null 2>&1; then
             apt-get update && apt-get install -y python3
+        else
+            die "无法自动安装 python3，请先手动安装。"
         fi
+    fi
+    local required=(curl python3 bash install mktemp realpath)
+    local cmd
+    for cmd in "${required[@]}"; do command -v "$cmd" >/dev/null 2>&1 || die "缺少必要命令: $cmd"; done
+}
+
+download_script() {
+    local download_url="$1"
+    local target_file="$2"
+    local tmp_file
+    tmp_file="$(mktemp "${target_file}.tmp.XXXXXX")" || return 1
+
+    if ! curl -fsSL -o "$tmp_file" "$download_url"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    if ! bash -n "$tmp_file"; then
+        warn "下载内容未通过 Bash 语法检查，拒绝覆盖 $target_file。"
+        rm -f "$tmp_file"
+        return 1
+    fi
+    if ! chmod 0755 "$tmp_file" || ! mv -f "$tmp_file" "$target_file"; then
+        rm -f "$tmp_file"
+        return 1
     fi
 }
 
@@ -76,12 +104,12 @@ pull_and_run() {
 
     info "正在拉取: $script_name ..."
     
-    if curl -fsSL -o "$target_file" "$download_url"; then
-        chmod +x "$target_file"
+    if download_script "$download_url" "$target_file"; then
         info "拉取成功，正在$desc..."
         echo "----------------------------------------------------------------"
-        cd "$WORK_DIR" || die "无法进入 $WORK_DIR"
-        ./"$script_name"
+        if ! (cd "$WORK_DIR" && ./"$script_name"); then
+            warn "$script_name 执行失败，请查看上方错误信息。"
+        fi
         
         echo "----------------------------------------------------------------"
         read -n 1 -s -r -p "子脚本执行结束，按任意键返回主菜单..." || true
@@ -97,8 +125,7 @@ update_self() {
     info "正在检查更新..."
     local download_url="${BASE_URL}/mihomo_manager.sh"
     
-    if curl -fsSL -o "$MANAGER_PATH" "$download_url"; then
-        chmod +x "$MANAGER_PATH"
+    if download_script "$download_url" "$MANAGER_PATH"; then
         info "脚本更新成功！正在重新加载..."
         sleep 1
         exec "$MANAGER_PATH"
