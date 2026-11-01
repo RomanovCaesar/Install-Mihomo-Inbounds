@@ -78,6 +78,20 @@ curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/
 curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/uninstall_mihomo.sh -o uninstall_mihomo.sh && chmod +x uninstall_mihomo.sh && sudo ./uninstall_mihomo.sh
 ```
 
+### 7. 非交互式一键搭建 (Flag 模式)
+适合批量部署或自动化脚本：直接用命令行参数搭建节点，不进入菜单（原有交互菜单不受影响）。所有参数均可省略，省略时使用默认值或随机生成。
+```bash
+curl -L https://raw.githubusercontent.com/RomanovCaesar/Install-Mihomo-Inbounds/main/mihomo_cli.sh -o mihomo_cli.sh && chmod +x mihomo_cli.sh
+
+sudo ./mihomo_cli.sh reality   --port 443 --sni hk.art.museum [--uuid <UUID>]
+sudo ./mihomo_cli.sh ss        --port 2022 --method 2022-blake3-aes-256-gcm [--password <密码>]
+sudo ./mihomo_cli.sh vless-enc --port 40000 [--uuid <UUID>]
+sudo ./mihomo_cli.sh address   my.ddns.net     # 设置 NAT/DDNS 连接地址，auto 恢复自动获取
+```
+* `--address <地址|auto>`：搭建前先设置连接地址，`auto` 为自动获取公网 IP，不传则沿用当前设置，例如 `sudo ./mihomo_cli.sh reality --address my.ddns.net`
+* `-q` / `--quiet`：成功时只输出分享链接，方便其他脚本捕获
+* `-h` / `--help`：查看完整帮助
+
 ---
 
 ## 🔄 与 Xray 版本的对应关系

@@ -1069,10 +1069,64 @@ main_menu() {
     done
 }
 
+ss_key_len_for_method() {
+    case "$1" in
+        2022-blake3-aes-128-gcm|aes-128-gcm) echo 16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305|aes-256-gcm|chacha20-ietf-poly1305) echo 32 ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- 非交互安装 (flag 模式) ---
+install_ss_noninteractive() {
+    local port="" method="" password=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port|--method|--password)
+                [[ $# -ge 2 ]] || { error "参数 $1 缺少值"; return 1; }
+                case "$1" in
+                    --port) port="$2" ;; --method) method="$2" ;; --password) password="$2" ;;
+                esac
+                shift 2
+                ;;
+            --quiet|-q) is_quiet=true; shift ;;
+            *) error "未知参数: $1"; return 1 ;;
+        esac
+    done
+    [[ -z "$port" ]] && port=2022
+    [[ -z "$method" ]] && method="2022-blake3-aes-256-gcm"
+    if ! is_valid_port "$port"; then error "端口无效: $port"; return 1; fi
+    local key_len
+    if ! key_len=$(ss_key_len_for_method "$method"); then error "不支持的加密方式: $method"; return 1; fi
+    if [[ -z "$password" ]]; then
+        password=$(openssl rand -base64 "$key_len" | tr -d '\n')
+    elif [[ "$method" == 2022-* ]]; then
+        # SS2022 要求密码为指定长度密钥的 Base64 编码
+        if ! python3 -c 'import base64,sys; sys.exit(0 if len(base64.b64decode(sys.argv[1], validate=True)) == int(sys.argv[2]) else 1)' "$password" "$key_len" 2>/dev/null; then
+            error "$method 的密码必须是 ${key_len} 字节密钥的 Base64 编码 (可用 openssl rand -base64 ${key_len} 生成)"
+            return 1
+        fi
+    fi
+    if is_port_in_use "$port"; then error "端口 $port 已被占用"; return 1; fi
+
+    if ! install_mihomo_core; then return 1; fi
+    install_geodata || return 1
+    append_ss_config "$port" "$method" "$password" || return 1
+    setup_service || return 1
+    service_restart || return 1
+    success "安装配置完成！"
+    view_subscription_info "$port"
+}
+
 main() {
     pre_check
     if [[ $# -gt 0 && "$1" == "install" ]]; then
-        install_ss
+        shift
+        if [[ $# -gt 0 ]]; then
+            install_ss_noninteractive "$@" || exit 1
+        else
+            install_ss
+        fi
     else
         main_menu
     fi
