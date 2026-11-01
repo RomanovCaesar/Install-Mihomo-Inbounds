@@ -287,7 +287,7 @@ backup_config() {
     printf '%s\n' "$backup"
 }
 
-+backup_config_archive() {
+backup_config_archive() {
     [[ -d "$mihomo_config_dir" ]] || return 0
     local archive
     archive=$(mktemp "/root/mihomo-config-backup-$(date +%Y%m%d%H%M%S).XXXXXX.tar.gz") || return 1
@@ -952,9 +952,52 @@ main_menu() {
     done
 }
 
+# --- 非交互安装 (flag 模式) ---
+install_vless_pq_noninteractive() {
+    local port="" uuid=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port|--uuid)
+                [[ $# -ge 2 ]] || { error "参数 $1 缺少值"; return 1; }
+                case "$1" in
+                    --port) port="$2" ;; --uuid) uuid="$2" ;;
+                esac
+                shift 2
+                ;;
+            --quiet|-q) is_quiet=true; shift ;;
+            *) error "未知参数: $1"; return 1 ;;
+        esac
+    done
+    [[ -z "$port" ]] && port=40000
+    [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/^\(........\)\(....\)\(....\)\(....\)\(............\)$/\1-\2-\3-\4-\5/')
+    if ! is_valid_port "$port"; then error "端口无效: $port"; return 1; fi
+    if ! is_valid_uuid "$uuid"; then error "UUID格式无效: $uuid"; return 1; fi
+    if is_port_in_use "$port"; then error "端口 $port 已被占用"; return 1; fi
+
+    if ! install_mihomo_core; then return 1; fi
+    install_geodata || return 1
+    if ! generate_vless_tokens; then return 1; fi
+    append_vless_config "$port" "$uuid" "$VLESS_DECRYPTION" || return 1
+    setup_service || return 1
+    if ! service_restart; then return 1; fi
+    echo "$VLESS_ENCRYPTION" > "/root/mihomo_vless_encryption_client_key_${port}.txt"
+    chmod 600 "/root/mihomo_vless_encryption_client_key_${port}.txt"
+    success "Mihomo VLESS PQ 安装配置成功！"
+    view_subscription_info "$port"
+}
+
 main() {
     pre_check
-    if [[ $# -gt 0 && "$1" == "install" ]]; then install_vless_pq; else main_menu; fi
+    if [[ $# -gt 0 && "$1" == "install" ]]; then
+        shift
+        if [[ $# -gt 0 ]]; then
+            install_vless_pq_noninteractive "$@" || exit 1
+        else
+            install_vless_pq
+        fi
+    else
+        main_menu
+    fi
 }
 
 main "$@"
