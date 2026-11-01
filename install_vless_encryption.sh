@@ -287,7 +287,7 @@ backup_config() {
     printf '%s\n' "$backup"
 }
 
-+backup_config_archive() {
+backup_config_archive() {
     [[ -d "$mihomo_config_dir" ]] || return 0
     local archive
     archive=$(mktemp "/root/mihomo-config-backup-$(date +%Y%m%d%H%M%S).XXXXXX.tar.gz") || return 1
